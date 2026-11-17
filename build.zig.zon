@@ -1,0 +1,22 @@
+.{
+    .name = .pek_zwaf,
+    .version = "0.1.0",
+    .fingerprint = 0x45872a9e8471b693,
+    .minimum_zig_version = "0.17.0",
+
+    // zzig 是 Zig 侧的公共基础库（对齐 Rust 侧 dhrust）：
+    // 本库只依赖它的 http/router 请求模型、logs、config/toml、net（CIDR）。
+    .dependencies = .{
+        .zzig = .{
+            .path = "../zzig",
+        },
+    },
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "docs",
+        "README.md",
+    },
+}
