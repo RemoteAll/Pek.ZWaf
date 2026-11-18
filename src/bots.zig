@@ -9,6 +9,7 @@
 //! - `unknown`：疑似机器人（UA 含 bot/spider/crawl 等词但不在名单）。
 
 const std = @import("std");
+const zzig = @import("zzig");
 
 /// 爬虫分类。
 pub const BotKind = enum {
@@ -227,24 +228,12 @@ fn hitAny(lower: []const u8, list: []const []const u8) bool {
 }
 
 /// 不区分大小写的子串查找（超长 UA 兜底路径用，避免为分类整体分配）。
-fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
-    if (needle.len == 0) return 0;
-    if (needle.len > haystack.len) return null;
-    var i: usize = 0;
-    const last = haystack.len - needle.len;
-    while (i <= last) : (i += 1) {
-        var j: usize = 0;
-        while (j < needle.len) : (j += 1) {
-            if (std.ascii.toLower(haystack[i + j]) != needle[j]) break;
-        }
-        if (j == needle.len) return i;
-    }
-    return null;
-}
-
+///
+/// **复用 `zzig.Strings.containsIgnoreCase`**：本仓库原先自己写了一份逐字节循环，
+/// 与公共库语义相同（空 needle 为 true），没必要留第二份实现。
 fn hitAnyIgnoreCase(text: []const u8, list: []const []const u8) bool {
     for (list) |k| {
-        if (indexOfIgnoreCase(text, k) != null) return true;
+        if (zzig.Strings.containsIgnoreCase(text, k)) return true;
     }
     return false;
 }

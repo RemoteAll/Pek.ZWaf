@@ -164,10 +164,36 @@ try app.useMiddleware(waf.middleware());      // WAF 放最外层
 try app.useMiddleware(throttle.middleware());  // 限流放其后
 ```
 
+> **IP 策略前提**：CC 限速与 `throttle` 的 `ip` / `whenNull=intercept` 都需要对端地址。
+> 直接调用 `Waf.checkRouteRequest` / `Throttle.check` 并显式传 `remote_addr` 时生效；
+> 经 `zzig.web.App` 接入时，`zzig.http_server.RequestView` 目前不带对端地址
+> （`Request.remote_addr` 为空），因此 IP 维度不生效——见 `docs/设计说明.md` §9。
+
+## 性能基准（100 万口径）
+
+```powershell
+zig build bench -Doptimize=ReleaseFast
+```
+
+本机 Windows / Zig 0.17.1 实测（100 万次判定，详见 `docs/设计说明.md` §8）：
+
+| 场景 | 耗时 |
+| --- | --- |
+| 放行：浏览器 GET | **365.6 ns/次** |
+| 拦截：SQL 注入查询串 | **510.5 ns/次** |
+| 拦截：恶意 UA（早拦） | 247.0 ns/次 |
+| 放行：静态资源 | 272.0 ns/次 |
+| 放行：POST 8 KB body | 23.98 µs/次 |
+| 100 万条 IP 黑名单（未命中） | 204.5 ns/次 |
+| 1000 条自定义规则（未命中） | 3.20 µs/次 |
+
+特征共 82 条（SQLi 30 / XSS 13 / 路径 28 / 命令 11），命中检测是**单遍扫描**
+（首字节桶 + 第二字节过滤），不再是对每个特征各做一次 `indexOf`。
+
 ## 运行验证
 
 ```powershell
-zig build test     # 单元测试
+zig build test     # 单元测试（基线 52 项）
 zig build demo     # 启动演示服务后按 examples/waf_demo.zig 顶部注释用 curl 验证
 ```
 
@@ -184,11 +210,12 @@ src/
   throttle.zig  接口级限流（7 策略 / 多阀门 / 429 多格式）
   ratelimit.zig 固定窗口计数引擎
   stats.zig     运行统计（原子计数 + 固定容量 Top 表）
-  wafreq.zig    请求视图 + IP 匹配（CIDR / 通配符 / 文件）
+  wafreq.zig    请求视图 + IP 匹配（CIDR / 通配符 / 文件 / 预编译 IpSet）
   gen.zig       引用计数的配置代（热重载安全替换）
   clock.zig     墙钟（复用 zzig.compat）
   regex.zig     正则薄封装（vendor 自生态既有实现）
   vendor/regex.zig  ZZUI 回溯正则引擎（字节级拷贝，见 docs/设计说明.md）
+bench/waf_bench.zig    性能基准（100 万次判定 / 100 万条名单）
 examples/waf_demo.zig  端到端演示
 docs/设计说明.md        移植对照与决策记录
 ```

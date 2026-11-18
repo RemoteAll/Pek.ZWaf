@@ -77,13 +77,22 @@ pub const Stage = struct {
 const WafPayload = struct {
     cfg: WafConfig,
     compiled: []const rules.Compiled = &.{},
+    /// 预编译 IP 名单（精确走 u32 哈希、CIDR 走预解析网段；按 100 万条规模设计）
+    ip_allow: wafreq.IpSet = .{},
+    ip_block: wafreq.IpSet = .{},
 };
 
 /// 配置代（引用计数：检查期间持有，热重载时整体替换）。
 const Gen = gen.Gen(WafPayload);
 
 fn makeGen(gpa: std.mem.Allocator, loaded: *config.Loaded) !*Gen {
-    return Gen.create(gpa, loaded.take(), .{ .cfg = loaded.config });
+    const g = try Gen.create(gpa, loaded.take(), .{ .cfg = loaded.config });
+    errdefer g.unref(gpa);
+    // 名单只在配置期解析一次；arena 随本配置代释放
+    const a = g.arena.allocator();
+    g.payload.ip_allow = wafreq.IpSet.build(a, loaded.config.ipWhitelist) catch wafreq.IpSet{};
+    g.payload.ip_block = wafreq.IpSet.build(a, loaded.config.ipBlacklist) catch wafreq.IpSet{};
+    return g;
 }
 
 /// 拦截日志去重器：同「IP + 原因」在 1 秒窗口内只放行一条日志。
@@ -127,6 +136,57 @@ const LogThrottle = struct {
     }
 };
 
+/// `Stage` 有界对象池。
+///
+/// 为什么需要：中间件每请求都要一份临时缓冲，`var stage = Stage{}` + `deinit`
+/// 会让两个 `ArrayList` 次次重新分配/扩容。池化后稳态零系统分配。
+///
+/// 为什么不用 `threadlocal`：zzig 服务端是 thread-per-connection，线程退出时
+/// 堆缓冲不会自动释放，等于每连接泄漏一份；这里用全局锁保护的小池（容量有界）。
+const StagePool = struct {
+    mutex: zzig.compat.Mutex = .{},
+    free: std.ArrayListUnmanaged(*Stage) = .empty,
+    max: usize = 64,
+
+    fn acquire(self: *StagePool, gpa: std.mem.Allocator) ?*Stage {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.free.pop()) |s| return s;
+        const s = gpa.create(Stage) catch return null;
+        s.* = .{};
+        return s;
+    }
+
+    fn release(self: *StagePool, gpa: std.mem.Allocator, s: *Stage) void {
+        self.mutex.lock();
+        if (self.free.items.len < self.max) {
+            self.free.append(gpa, s) catch {
+                self.mutex.unlock();
+                s.deinit(gpa);
+                gpa.destroy(s);
+                return;
+            };
+            self.mutex.unlock();
+            return;
+        }
+        self.mutex.unlock();
+        // 池满：直接释放（不无限缓存）
+        s.deinit(gpa);
+        gpa.destroy(s);
+    }
+
+    fn deinit(self: *StagePool, gpa: std.mem.Allocator) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.free.items) |s| {
+            s.deinit(gpa);
+            gpa.destroy(s);
+        }
+        self.free.deinit(gpa);
+        self.free = .empty;
+    }
+};
+
 /// WAF 门面（线程安全）。
 pub const Waf = struct {
     gpa: std.mem.Allocator,
@@ -146,6 +206,8 @@ pub const Waf = struct {
     limiter: ratelimit.WindowLimiter,
     stats: stats.WafStats,
     log_throttle: LogThrottle = .{},
+    /// 每请求 Stage 复用池（稳态避免 ArrayList 反复分配/扩容）
+    stages: StagePool = .{},
 
     /// 可信业务请求签名密钥（内存态，不落配置文件）
     trusted_secret: ?[]const u8 = null,
@@ -231,6 +293,7 @@ pub const Waf = struct {
         self.gen.unref(self.gpa);
         self.limiter.deinit();
         self.log_throttle.deinit(self.gpa);
+        self.stages.deinit(self.gpa);
         if (self.file_path) |p| self.gpa.free(p);
         self.gpa.free(self.base_dir);
         if (self.forced_skip_bot.len > 0) self.gpa.free(self.forced_skip_bot);
@@ -401,9 +464,20 @@ pub const Waf = struct {
     /// 请求是否带当前可信业务签名（`TimeStamp` / `Nonce` / `Signature` 三头）。
     fn trustedSigned(self: *Waf, headers: []const std.http.Header) bool {
         const secret = self.trusted_secret orelse return false;
-        const timestamp = std.mem.trim(u8, headerOf(headers, "TimeStamp") orelse "", " \t");
-        const nonce = std.mem.trim(u8, headerOf(headers, "Nonce") orelse "", " \t");
-        const signature = std.mem.trim(u8, headerOf(headers, "Signature") orelse "", " \t");
+
+        // 一次遍历取三个头（原来三次 headerOf，等于扫三遍 header 列表）
+        var timestamp: []const u8 = "";
+        var nonce: []const u8 = "";
+        var signature: []const u8 = "";
+        for (headers) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "TimeStamp")) {
+                timestamp = std.mem.trim(u8, h.value, " \t");
+            } else if (std.ascii.eqlIgnoreCase(h.name, "Nonce")) {
+                nonce = std.mem.trim(u8, h.value, " \t");
+            } else if (std.ascii.eqlIgnoreCase(h.name, "Signature")) {
+                signature = std.mem.trim(u8, h.value, " \t");
+            }
+        }
         if (timestamp.len == 0 or nonce.len == 0 or signature.len == 0) return false;
 
         // 与 C# / dhrust 一致：三段升序排列后拼接，SHA1，小写 hex
@@ -420,12 +494,8 @@ pub const Waf = struct {
         var expected: [40]u8 = undefined;
         expected = std.fmt.bytesToHex(digest, .lower);
 
-        // 等长逐字节比较（定时攻击防护）
-        const a = expected[0..];
-        if (signature.len != a.len) return false;
-        var diff: u8 = 0;
-        for (a, signature) |x, y| diff |= x ^ y;
-        return diff == 0;
+        // 等长常量时间比较（复用 zzig 实现，不再手写一份）
+        return zzig.hash.constantTimeEql(expected[0..], signature);
     }
 
     // ————— 对外检查入口 —————
@@ -458,7 +528,8 @@ pub const Waf = struct {
         }
 
         // body 预览：只扫文本类（或配置强制全类型），且只取前 N 字节
-        if (!self.skipsAttack(&cfg, view.path)) {
+        // 无 body 的请求（GET/HEAD 等）不必查 Content-Type
+        if (req.body.len > 0 and !self.skipsAttack(&cfg, view.path)) {
             const is_text = wafreq.isTextContentType(view.content_type);
             if (cfg.bodyScanAllTypes or is_text) {
                 view = view.withBodyPreview(req.body, cfg.bodyLimit());
@@ -468,11 +539,14 @@ pub const Waf = struct {
     }
 
     /// **头阶段**检查（还没读 body 时调）：与完整检查同规则，但
-    /// - **不**累加请求总数（避免与之后的完整检查重复计数）；拦截仍正常计入统计；
+    /// - **不**累加请求总数（避免「早拒放行 → 路由层完整检查」重复计数）；
+    /// - **拦截时补记一次总数**：该请求不会再进路由层，不记就无法算拦截率
+    ///   （demo 实测曾有 `blockedRatio = 1.5` 的口径缺陷）；
     /// - 只能看路径 / 查询串 / UA / IP / 头（`body_text` 为空）。
     ///
     /// 挂到 HTTP 层早拒钩子后，UA / IP / 路径 / 查询串命中特征时可以**不收 body 就拒绝**。
     pub fn checkHead(self: *Waf, head: HeadInput, stage: *Stage) Verdict {
+        self.maybeReload();
         const g = self.acquire();
         defer g.unref(self.gpa);
         const cfg = g.payload.cfg;
@@ -489,12 +563,16 @@ pub const Waf = struct {
             .headers = head.headers,
         };
 
-        if (cfg.enable and cfg.csrfGuard) {
-            if (csrfReason(view.method, headerOf(head.headers, "sec-fetch-site") orelse "", headerOf(head.headers, "origin") orelse "", headerOf(head.headers, "host") orelse "")) |reason| {
-                return self.blockedWith(g, &view, stage, 403, .csrf, "{s}", .{reason});
+        const verdict = blk: {
+            if (cfg.enable and cfg.csrfGuard) {
+                if (csrfReason(view.method, headerOf(head.headers, "sec-fetch-site") orelse "", headerOf(head.headers, "origin") orelse "", headerOf(head.headers, "host") orelse "")) |reason| {
+                    break :blk self.blockedWith(g, &view, stage, 403, .csrf, "{s}", .{reason});
+                }
             }
-        }
-        return self.decide(g, &view, stage, false);
+            break :blk self.decide(g, &view, stage, false);
+        };
+        if (!verdict.isAllow()) self.stats.recordRequest();
+        return verdict;
     }
 
     /// 便捷：从 zzig HTTP 服务端请求视图做头阶段检查。
@@ -541,13 +619,10 @@ pub const Waf = struct {
         if (cfg.loopbackBypass and wafreq.isLoopback(ip)) return .allow;
 
         // —— IP 白名单（显式信任，优先于一切）→ IP 黑名单 ——
-        for (cfg.ipWhitelist) |rule| {
-            if (wafreq.ipMatch(ip, rule)) return .allow;
-        }
-        for (cfg.ipBlacklist) |rule| {
-            if (wafreq.ipMatch(ip, rule)) {
-                return self.blockedWith(g, req, stage, 403, .ip, "IP 黑名单：{s}", .{ip});
-            }
+        // 名单在配置代里已预编译：匹配只解析请求 IP 一次，不再逐条解析规则字符串。
+        if (!g.payload.ip_allow.isEmpty() and g.payload.ip_allow.matches(ip)) return .allow;
+        if (g.payload.ip_block.matches(ip)) {
+            return self.blockedWith(g, req, stage, 403, .ip, "IP 黑名单：{s}", .{ip});
         }
 
         const ua = std.mem.trim(u8, req.user_agent, " \t\r\n");
@@ -618,43 +693,50 @@ pub const Waf = struct {
         // —— 攻击特征 ——
         if (!self.skipsAttack(&cfg, req.path)) {
             const is_static = wafreq.isStaticAsset(req.path);
-            const bits = if (req.body_text.len == 0)
-                (if (is_static)
-                    attack.scanPathBitsWith(self.gpa, &stage.attack_scratch, req.path, req.query)
-                else
-                    attack.scanAllBitsWith(self.gpa, &stage.attack_scratch, req.path, req.query, "")) catch 0
-            else if (is_static)
-                attack.scanPathBitsWith(self.gpa, &stage.attack_scratch, req.path, req.query) catch 0
-            else
-                attack.scanAllBitsWith(self.gpa, &stage.attack_scratch, req.path, req.query, req.body_text) catch 0;
+            // 动作 `off` 的类别不参与扫描（旧实现无条件全扫，`off` 只是不拦，白扫 82 条）
+            var mask: u8 = 0;
+            if (cfg.path() != .off) mask |= attack.K_PATH;
+            if (!is_static) {
+                if (cfg.sqli() != .off) mask |= attack.K_SQLI;
+                if (cfg.cmd() != .off) mask |= attack.K_CMD;
+                if (cfg.xss() != .off) mask |= attack.K_XSS;
+            }
 
-            var kinds: [4]attack.AttackKind = undefined;
-            const n = attack.kindsFromBits(bits, &kinds);
-            for (kinds[0..n]) |kind| {
-                var action: Action = switch (kind) {
-                    .sqli => cfg.sqli(),
-                    .xss => cfg.xss(),
-                    .path => cfg.path(),
-                    .cmd => cfg.cmd(),
-                };
-                if (sensitive and action == .monitor) action = .block;
-                switch (action) {
-                    .off => {},
-                    .monitor => {
-                        if (cfg.verbose) {
-                            zzig.Logger.info("[WAF] 监控命中 {s}：{s} {s}", .{ kind.nameCn(), req.method, req.path });
-                        }
-                    },
-                    .block => {
-                        const block_kind: stats.BlockKind = switch (kind) {
-                            .sqli => .sqli,
-                            .xss => .xss,
-                            .path => .path,
-                            .cmd => .cmd,
-                        };
-                        var buf: [96]u8 = undefined;
-                        return self.blockedWith(g, req, stage, 403, block_kind, "{s} 特征：{s}", .{ kind.nameCn(), brief(&buf, req.path) });
-                    },
+            if (mask != 0) {
+                const parts: []const []const u8 = if (is_static or req.body_text.len == 0)
+                    &.{ req.path, "?", req.query }
+                else
+                    &.{ req.path, "?", req.query, " ", req.body_text };
+                const bits = attack.scanBitsWith(self.gpa, &stage.attack_scratch, parts, mask) catch 0;
+
+                var kinds: [4]attack.AttackKind = undefined;
+                const n = attack.kindsFromBits(bits, &kinds);
+                for (kinds[0..n]) |kind| {
+                    var action: Action = switch (kind) {
+                        .sqli => cfg.sqli(),
+                        .xss => cfg.xss(),
+                        .path => cfg.path(),
+                        .cmd => cfg.cmd(),
+                    };
+                    if (sensitive and action == .monitor) action = .block;
+                    switch (action) {
+                        .off => {},
+                        .monitor => {
+                            if (cfg.verbose) {
+                                zzig.Logger.info("[WAF] 监控命中 {s}：{s} {s}", .{ kind.nameCn(), req.method, req.path });
+                            }
+                        },
+                        .block => {
+                            const block_kind: stats.BlockKind = switch (kind) {
+                                .sqli => .sqli,
+                                .xss => .xss,
+                                .path => .path,
+                                .cmd => .cmd,
+                            };
+                            var buf: [96]u8 = undefined;
+                            return self.blockedWith(g, req, stage, 403, block_kind, "{s} 特征：{s}", .{ kind.nameCn(), brief(&buf, req.path) });
+                        },
+                    }
                 }
             }
         }
@@ -763,11 +845,21 @@ pub const ServerGuard = struct {
 
     fn invoke(raw: *anyopaque, req: zzig.http_server.RequestView, arena: std.mem.Allocator) anyerror!zzig.http_server.Reply {
         const self: *ServerGuard = @ptrCast(@alignCast(raw));
-        // 每请求独立 Stage（服务端是多线程，不能共享缓冲）
-        var stage = Stage{};
-        defer stage.deinit(self.waf.gpa);
+        // 池化复用（分配失败时降级为栈上 Stage，不影响拦截）
+        const stage = self.waf.stages.acquire(self.waf.gpa) orelse return self.invokeWith(req, arena, null);
+        defer self.waf.stages.release(self.waf.gpa, stage);
+        return self.invokeWith(req, arena, stage);
+    }
 
-        switch (self.waf.checkHeadView(req, &stage)) {
+    fn invokeWith(self: *ServerGuard, req: zzig.http_server.RequestView, arena: std.mem.Allocator, pooled: ?*Stage) anyerror!zzig.http_server.Reply {
+        var local = Stage{};
+        const stage: *Stage = blk: {
+            if (pooled) |s| break :blk s;
+            break :blk &local;
+        };
+        defer if (pooled == null) local.deinit(self.waf.gpa);
+
+        switch (self.waf.checkHeadView(req, stage)) {
             .allow => return self.inner(self.inner_ctx, req, arena),
             .blocked => |b| {
                 const status: std.http.Status = if (b.status == 429) .too_many_requests else .forbidden;
@@ -799,10 +891,26 @@ fn middlewareInvoke(
     next: zzig.web.router.Next,
 ) anyerror!zzig.web.router.Response {
     const waf: *Waf = @ptrCast(@alignCast(ctx orelse return error.InvalidMiddleware));
-    var stage = Stage{};
-    defer stage.deinit(waf.gpa);
+    // 池化复用（分配失败时降级为栈上 Stage，不影响拦截）
+    const stage = waf.stages.acquire(waf.gpa) orelse return middlewareWith(waf, c, next, null);
+    defer waf.stages.release(waf.gpa, stage);
+    return middlewareWith(waf, c, next, stage);
+}
 
-    switch (waf.checkCtx(c, &stage)) {
+fn middlewareWith(
+    waf: *Waf,
+    c: *zzig.web.router.Ctx,
+    next: zzig.web.router.Next,
+    pooled: ?*Stage,
+) anyerror!zzig.web.router.Response {
+    var local = Stage{};
+    const stage: *Stage = blk: {
+        if (pooled) |s| break :blk s;
+        break :blk &local;
+    };
+    defer if (pooled == null) local.deinit(waf.gpa);
+
+    switch (waf.checkCtx(c, stage)) {
         .allow => return next.run(c),
         .blocked => |b| {
             if (b.status == 429) {
@@ -824,10 +932,8 @@ fn middlewareInvoke(
 }
 
 fn headerOf(headers: []const std.http.Header, name: []const u8) ?[]const u8 {
-    for (headers) |h| {
-        if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
-    }
-    return null;
+    // 单一实现：转调 `wafreq.headerOf`（本文件曾与它各写一份遍历）
+    return wafreq.headerOf(headers, name);
 }
 
 fn matchesAnyPrefix(prefixes: []const []const u8, path: []const u8) bool {
@@ -1108,4 +1214,30 @@ test "中间件阻止与放行" {
     const verdict = waf.checkCtx(&ctx, &stage);
     try testing.expect(!verdict.isAllow());
     try testing.expectEqual(@as(u16, 403), verdict.blocked.status);
+}
+
+test "早拒拦截补记请求总数（拦截率不超过 1）" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var cfg = WafConfig.adminApi();
+    cfg.loopbackBypass = false;
+    const waf = try testWaf(&arena, cfg);
+    defer waf.deinit();
+
+    var stage = Stage{};
+    defer stage.deinit(waf.gpa);
+
+    // 早拒拦截：`/.env` 命中路径特征；该请求不会再进路由层，必须补记总数
+    const v = waf.checkHead(.{ .method = "GET", .path = "/.env", .remote_addr = "8.8.8.8" }, &stage);
+    try testing.expect(!v.isAllow());
+    var snap = waf.snapshot();
+    try testing.expectEqual(@as(u64, 1), snap.total);
+    try testing.expectEqual(@as(u64, 1), snap.blocked);
+    try testing.expect(snap.blocked_ratio <= 1.0);
+
+    // 早拒放行：不累加总数（由路由层完整检查计数，避免重复）
+    const ok = waf.checkHead(.{ .method = "GET", .path = "/ping", .remote_addr = "8.8.8.8" }, &stage);
+    try testing.expect(ok.isAllow());
+    snap = waf.snapshot();
+    try testing.expectEqual(@as(u64, 1), snap.total);
 }

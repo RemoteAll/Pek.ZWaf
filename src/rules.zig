@@ -44,10 +44,14 @@ pub const Compiled = union(enum) {
     leaf: struct {
         /// 人类可读描述（日志）
         label: []const u8,
-        /// 成员名（原样；求值时大小写不敏感）
+        /// 成员名（原样；诊断/兼容用）
         member: []const u8,
-        /// 操作符（已小写）
+        /// 成员（编译期解析；求值不再做字符串比较）
+        member_kind: Member,
+        /// 操作符（已小写；诊断/兼容用）
         op: []const u8,
+        /// 操作符（编译期解析）
+        op_kind: Op,
         /// 输入值（已字符串化；IpInFile 已展开为文件内容）
         inputs: []const []const u8,
         /// 目标值
@@ -57,6 +61,87 @@ pub const Compiled = union(enum) {
         /// IsMatch 的模式（编译期已校验合法性）
         pattern: ?[]const u8,
     },
+};
+
+/// 规则成员（编译期解析）。
+pub const Member = enum {
+    path,
+    method,
+    user_agent,
+    remote_ip,
+    query_string,
+    content_type,
+    unknown,
+
+    fn fromName(name: []const u8) Member {
+        if (lowerEq(name, "Path")) return .path;
+        if (lowerEq(name, "Method")) return .method;
+        if (lowerEq(name, "UserAgent")) return .user_agent;
+        if (lowerEq(name, "RemoteIp") or lowerEq(name, "IpAddress") or lowerEq(name, "RemoteIpAddress")) return .remote_ip;
+        if (lowerEq(name, "QueryString")) return .query_string;
+        if (lowerEq(name, "ContentType")) return .content_type;
+        return .unknown;
+    }
+};
+
+/// 规则操作符（编译期解析；`op` 原串保留供日志）。
+pub const Op = enum {
+    endswith,
+    startswith,
+    contains,
+    equals,
+    equal,
+    ismatch,
+    isinput,
+    isinteger,
+    isdouble,
+    issingle,
+    isdecimal,
+    isiniplist,
+    isnotiniplist,
+    ipinfile,
+    insubnet,
+    containsuseragent,
+    notcontainsuseragent,
+    isinuseragentlist,
+    isnotinuseragentlist,
+    useragentstartswith,
+    useragentisempty,
+    useragentisnotempty,
+    isbotkind,
+    unknown,
+
+    fn fromName(name: []const u8) Op {
+        const table = .{
+            .{ "endswith", Op.endswith },
+            .{ "startswith", Op.startswith },
+            .{ "contains", Op.contains },
+            .{ "equals", Op.equals },
+            .{ "equal", Op.equal },
+            .{ "ismatch", Op.ismatch },
+            .{ "isinput", Op.isinput },
+            .{ "isinteger", Op.isinteger },
+            .{ "isdouble", Op.isdouble },
+            .{ "issingle", Op.issingle },
+            .{ "isdecimal", Op.isdecimal },
+            .{ "isiniplist", Op.isiniplist },
+            .{ "isnotiniplist", Op.isnotiniplist },
+            .{ "ipinfile", Op.ipinfile },
+            .{ "insubnet", Op.insubnet },
+            .{ "containsuseragent", Op.containsuseragent },
+            .{ "notcontainsuseragent", Op.notcontainsuseragent },
+            .{ "isinuseragentlist", Op.isinuseragentlist },
+            .{ "isnotinuseragentlist", Op.isnotinuseragentlist },
+            .{ "useragentstartswith", Op.useragentstartswith },
+            .{ "useragentisempty", Op.useragentisempty },
+            .{ "useragentisnotempty", Op.useragentisnotempty },
+            .{ "isbotkind", Op.isbotkind },
+        };
+        inline for (table) |entry| {
+            if (std.mem.eql(u8, name, entry[0])) return entry[1];
+        }
+        return .unknown;
+    }
 };
 
 /// 规则编译错误（调用方负责把「哪个文件、哪个规则」写进日志）。
@@ -152,7 +237,9 @@ fn compileInner(arena: std.mem.Allocator, rule: *const Rule, io: std.Io, base_di
     return .{ .leaf = .{
         .label = node_label,
         .member = member,
+        .member_kind = Member.fromName(member),
         .op = op,
+        .op_kind = Op.fromName(op),
         .inputs = inputs,
         .target = target,
         .negate = rule.Negate,
@@ -176,11 +263,77 @@ pub fn eval(node: *const Compiled, req: *const WafRequest) bool {
             return false;
         },
         .leaf => |l| {
-            const value = req.member(l.member);
+            const value = memberValue(req, l.member_kind);
             const result = evalLeaf(l, value, req.user_agent);
             return if (l.negate) !result else result;
         },
     }
+}
+
+/// 成员取值（编译期 enum → 直接字段访问）。
+fn memberValue(req: *const WafRequest, m: Member) []const u8 {
+    return switch (m) {
+        .path => req.path,
+        .method => req.method,
+        .user_agent => req.user_agent,
+        .remote_ip => req.remote_ip,
+        .query_string => req.query,
+        .content_type => req.content_type,
+        .unknown => "",
+    };
+}
+
+fn anyEquals(value: []const u8, inputs: []const []const u8, target: []const u8) bool {
+    for (inputs) |i| {
+        if (lowerEq(value, i)) return true;
+    }
+    return target.len > 0 and lowerEq(value, target);
+}
+
+fn containsAny(value: []const u8, inputs: []const []const u8) bool {
+    for (inputs) |i| {
+        if (wafreq.containsIgnoreCase(value, i)) return true;
+    }
+    return false;
+}
+
+fn anyStartsWith(value: []const u8, inputs: []const []const u8) bool {
+    for (inputs) |i| {
+        if (startsWithIgnoreCase(value, i)) return true;
+    }
+    return false;
+}
+
+fn ipInInputs(value: []const u8, inputs: []const []const u8) bool {
+    for (inputs) |i| {
+        if (wafreq.ipInList(value, i)) return true;
+    }
+    return false;
+}
+
+fn isIntegerValue(value: []const u8) bool {
+    const t = std.mem.trim(u8, value, " \t\r\n");
+    _ = std.fmt.parseInt(i64, t, 10) catch return false;
+    return true;
+}
+
+fn isFloatValue(value: []const u8) bool {
+    const t = std.mem.trim(u8, value, " \t\r\n");
+    _ = std.fmt.parseFloat(f64, t) catch return false;
+    return true;
+}
+
+fn botKindValue(value: []const u8, target: []const u8, inputs: []const []const u8) bool {
+    const wanted = if (target.len > 0)
+        target
+    else if (inputs.len > 0)
+        inputs[0]
+    else
+        "";
+    const kind = bots.classify(value) orelse return false;
+    if (lowerEq(wanted, "any")) return true;
+    if (lowerEq(wanted, "friendly")) return kind.isFriendly();
+    return lowerEq(wanted, kind.nameEn());
 }
 
 /// 人类可读描述（日志用）。
@@ -231,112 +384,31 @@ pub fn startsWithIgnoreCase(hay: []const u8, needle: []const u8) bool {
 }
 
 fn evalLeaf(l: anytype, value: []const u8, user_agent: []const u8) bool {
-    const op: []const u8 = l.op;
-    if (std.mem.eql(u8, op, "endswith")) return hitAny(value, l.inputs, .ends);
-    if (std.mem.eql(u8, op, "startswith")) return hitAny(value, l.inputs, .starts);
-    if (std.mem.eql(u8, op, "contains")) return hitAny(value, l.inputs, .contains);
-    if (std.mem.eql(u8, op, "equals") or std.mem.eql(u8, op, "equal")) {
-        for (l.inputs) |i| {
-            if (lowerEq(value, i)) return true;
-        }
-        return l.target.len > 0 and lowerEq(value, l.target);
-    }
-    if (std.mem.eql(u8, op, "ismatch")) {
-        const p = l.pattern orelse return false;
-        return regex.isMatch(p, value);
-    }
-    if (std.mem.eql(u8, op, "isinput")) {
-        for (l.inputs) |i| {
-            if (lowerEq(value, i)) return true;
-        }
-        return false;
-    }
-    if (std.mem.eql(u8, op, "isinteger")) {
-        const t = std.mem.trim(u8, value, " \t\r\n");
-        _ = std.fmt.parseInt(i64, t, 10) catch return false;
-        return true;
-    }
-    if (std.mem.eql(u8, op, "isdouble") or std.mem.eql(u8, op, "issingle") or std.mem.eql(u8, op, "isdecimal")) {
-        const t = std.mem.trim(u8, value, " \t\r\n");
-        _ = std.fmt.parseFloat(f64, t) catch return false;
-        return true;
-    }
-    return evalExt(l, value, user_agent);
-}
-
-fn evalExt(l: anytype, value: []const u8, user_agent: []const u8) bool {
-    const op: []const u8 = l.op;
-    // —— IP 系 ——
-    if (std.mem.eql(u8, op, "isiniplist") or std.mem.eql(u8, op, "ipinfile")) {
-        for (l.inputs) |i| {
-            if (wafreq.ipInList(value, i)) return true;
-        }
-        return false;
-    }
-    if (std.mem.eql(u8, op, "isnotiniplist")) {
-        for (l.inputs) |i| {
-            if (wafreq.ipInList(value, i)) return false;
-        }
-        return true;
-    }
-    if (std.mem.eql(u8, op, "insubnet")) {
-        if (l.inputs.len == 0) return false;
-        const net = l.inputs[0];
-        const mask = if (l.inputs.len > 1) l.inputs[1] else "";
-        return wafreq.ipInSubnet(value, net, mask);
-    }
-    // —— UA 系（对 UserAgent 成员操作，忽略大小写）——
-    if (std.mem.eql(u8, op, "containsuseragent")) {
-        for (l.inputs) |i| {
-            if (wafreq.containsIgnoreCase(user_agent, i)) return true;
-        }
-        return false;
-    }
-    if (std.mem.eql(u8, op, "notcontainsuseragent")) {
-        for (l.inputs) |i| {
-            if (wafreq.containsIgnoreCase(user_agent, i)) return false;
-        }
-        return true;
-    }
-    if (std.mem.eql(u8, op, "isinuseragentlist")) {
-        for (l.inputs) |i| {
-            if (lowerEq(user_agent, i)) return true;
-        }
-        return false;
-    }
-    if (std.mem.eql(u8, op, "isnotinuseragentlist")) {
-        for (l.inputs) |i| {
-            if (lowerEq(user_agent, i)) return false;
-        }
-        return true;
-    }
-    if (std.mem.eql(u8, op, "useragentstartswith")) {
-        for (l.inputs) |i| {
-            if (startsWithIgnoreCase(user_agent, i)) return true;
-        }
-        return false;
-    }
-    if (std.mem.eql(u8, op, "useragentisempty")) {
-        return std.mem.trim(u8, user_agent, " \t\r\n").len == 0;
-    }
-    if (std.mem.eql(u8, op, "useragentisnotempty")) {
-        return std.mem.trim(u8, user_agent, " \t\r\n").len != 0;
-    }
-    // —— 扩展：按爬虫分类命中 ——
-    if (std.mem.eql(u8, op, "isbotkind")) {
-        const wanted = if (l.target.len > 0)
-            l.target
-        else if (l.inputs.len > 0)
-            l.inputs[0]
-        else
-            "";
-        const kind = bots.classify(value) orelse return false;
-        if (lowerEq(wanted, "any")) return true;
-        if (lowerEq(wanted, "friendly")) return kind.isFriendly();
-        return lowerEq(wanted, kind.nameEn());
-    }
-    // 未知操作符：不命中（宽容，避免误拦）
-    return false;
+    return switch (l.op_kind) {
+        .endswith => hitAny(value, l.inputs, .ends),
+        .startswith => hitAny(value, l.inputs, .starts),
+        .contains => hitAny(value, l.inputs, .contains),
+        .equals, .equal => anyEquals(value, l.inputs, l.target),
+        .ismatch => if (l.pattern) |p| regex.isMatch(p, value) else false,
+        .isinput => anyEquals(value, l.inputs, ""),
+        .isinteger => isIntegerValue(value),
+        .isdouble, .issingle, .isdecimal => isFloatValue(value),
+        // —— IP 系 ——
+        .isiniplist, .ipinfile => ipInInputs(value, l.inputs),
+        .isnotiniplist => !ipInInputs(value, l.inputs),
+        .insubnet => if (l.inputs.len == 0) false else wafreq.ipInSubnet(value, l.inputs[0], if (l.inputs.len > 1) l.inputs[1] else ""),
+        // —— UA 系（对 UserAgent 成员操作，忽略大小写）——
+        .containsuseragent => containsAny(user_agent, l.inputs),
+        .notcontainsuseragent => !containsAny(user_agent, l.inputs),
+        .isinuseragentlist => anyEquals(user_agent, l.inputs, ""),
+        .isnotinuseragentlist => !anyEquals(user_agent, l.inputs, ""),
+        .useragentstartswith => anyStartsWith(user_agent, l.inputs),
+        .useragentisempty => std.mem.trim(u8, user_agent, " \t\r\n").len == 0,
+        .useragentisnotempty => std.mem.trim(u8, user_agent, " \t\r\n").len != 0,
+        .isbotkind => botKindValue(value, l.target, l.inputs),
+        // 未知操作符：不命中（宽容，避免误拦）
+        .unknown => false,
+    };
 }
 
 // —— 测试 ——

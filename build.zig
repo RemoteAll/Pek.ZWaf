@@ -41,4 +41,19 @@ pub fn build(b: *std.Build) void {
 
     const demo_step = b.step("demo", "启动 WAF 演示服务（127.0.0.1:18080）");
     demo_step.dependOn(&run_demo.step);
+
+    // 性能基准（100 万次判定 / 100 万条名单）：`zig build bench -Doptimize=ReleaseFast`
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/waf_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bench_mod.addImport("zzig", zzig_dep.module("zzig"));
+    bench_mod.addImport("pek_zwaf", mod);
+
+    const bench_exe = b.addExecutable(.{ .name = "zwaf-bench", .root_module = bench_mod });
+    const run_bench = b.addRunArtifact(bench_exe);
+
+    const bench_step = b.step("bench", "运行性能基准（建议 -Doptimize=ReleaseFast）");
+    bench_step.dependOn(&run_bench.step);
 }

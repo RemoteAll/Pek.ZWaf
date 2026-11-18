@@ -79,11 +79,18 @@ pub const WafRequest = struct {
     }
 };
 
-fn headerOf(headers: []const std.http.Header, name: []const u8) ?[]const u8 {
+fn headerOfImpl(headers: []const std.http.Header, name: []const u8) ?[]const u8 {
     for (headers) |h| {
         if (eqIgnoreCase(h.name, name)) return h.value;
     }
     return null;
+}
+
+/// 取请求头（大小写不敏感）。
+///
+/// **单一实现**：`waf.zig` 与规则引擎都转调这里，不要再各写一份遍历。
+pub fn headerOf(headers: []const std.http.Header, name: []const u8) ?[]const u8 {
+    return headerOfImpl(headers, name);
 }
 
 /// 不区分大小写比较（两端都可能存在大小写差异）。
@@ -92,19 +99,11 @@ pub fn eqIgnoreCase(a: []const u8, b: []const u8) bool {
 }
 
 /// 不区分大小写的子串包含。
+///
+/// **复用 `zzig.Strings.containsIgnoreCase`**（生态内已有实现，语义一致：
+/// 空 needle 为 true，逐起点切片比较）。
 pub fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (needle.len > haystack.len) return false;
-    var i: usize = 0;
-    const last = haystack.len - needle.len;
-    while (i <= last) : (i += 1) {
-        var j: usize = 0;
-        while (j < needle.len) : (j += 1) {
-            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(needle[j])) break;
-        }
-        if (j == needle.len) return true;
-    }
-    return false;
+    return zzig.Strings.containsIgnoreCase(haystack, needle);
 }
 
 fn trimList(s: []const u8) []const u8 {
@@ -121,17 +120,26 @@ pub fn stripPort(addr: []const u8) []const u8 {
         if (std.mem.indexOfScalar(u8, a, ']')) |end| return a[1..end];
         return a;
     }
-    var colons: usize = 0;
-    for (a) |c| {
-        if (c == ':') colons += 1;
+    // 从尾部回扫：`host:digits` 才算带端口；裸 IPv6（多个冒号）原样返回。
+    // 旧实现先统计冒号再 lastIndexOf，等于把同一段地址扫三遍——热路径上没必要。
+    var i = a.len;
+    var digits: usize = 0;
+    var colon: ?usize = null;
+    while (i > 0) {
+        i -= 1;
+        const c = a[i];
+        if (std.ascii.isDigit(c)) {
+            digits += 1;
+            continue;
+        }
+        if (c == ':') {
+            if (digits == 0) return a; // `host:` 无端口
+            colon = i;
+        }
+        break;
     }
-    if (colons != 1) return a; // 无端口 / 裸 IPv6 / 非法
-    const idx = std.mem.lastIndexOfScalar(u8, a, ':').?;
-    const port = a[idx + 1 ..];
-    if (port.len == 0) return a;
-    for (port) |c| {
-        if (!std.ascii.isDigit(c)) return a;
-    }
+    const idx = colon orelse return a;
+    if (std.mem.indexOfScalar(u8, a[0..idx], ':') != null) return a; // 多个冒号 → 裸 IPv6
     return a[0..idx];
 }
 
@@ -280,6 +288,99 @@ pub fn isStaticAsset(path: []const u8) bool {
     return false;
 }
 
+/// 预编译的 IP 规则集（精确 / CIDR / 通配符 / 字面量分开存放）。
+///
+/// 为什么需要：`ipMatch` 每匹配一条规则都要 trim、找 `/`、解析 IPv4。名单几十条时
+/// 无所谓；**按 100 万条规模**时，一个请求就要做 100 万次字符串解析（实测：旧实现
+/// 单请求扫 100 万条 `/32` 约 30 ms 量级）。编译期（配置加载 / 热重载）解析一次后，
+/// 匹配只解析**请求 IP 一次**：精确规则走 u32 哈希、CIDR 走预解析网段比较。
+///
+/// 生命周期：`build` 的分配器通常是配置代 arena，随热重载整体释放（`deinit` 可省）。
+pub const IpSet = struct {
+    exact: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    cidrs: std.ArrayListUnmanaged(CidrEntry) = .empty,
+    wildcards: std.ArrayListUnmanaged([]const u8) = .empty,
+    literals: std.ArrayListUnmanaged([]const u8) = .empty,
+    any: bool = false,
+
+    pub const CidrEntry = struct { network: u32, mask: u32 };
+
+    fn maskOf(prefix: u32) u32 {
+        return if (prefix == 0) 0 else ~@as(u32, 0) << @intCast(32 - prefix);
+    }
+
+    pub fn build(allocator: std.mem.Allocator, rules: []const []const u8) !IpSet {
+        var set = IpSet{};
+        errdefer set.deinit(allocator);
+        for (rules) |raw| {
+            const rule = trimList(raw);
+            if (rule.len == 0) continue;
+            if (rule.len == 1 and rule[0] == '*') {
+                set.any = true;
+                continue;
+            }
+            if (std.mem.indexOfScalar(u8, rule, '/') != null) {
+                if (parseCidrRule(rule)) |c| {
+                    const mask = maskOf(c.prefix);
+                    if (c.prefix == 32) {
+                        try set.exact.put(allocator, c.network, {});
+                    } else {
+                        try set.cidrs.append(allocator, .{ .network = c.network & mask, .mask = mask });
+                    }
+                    continue;
+                }
+                // 非法 CIDR：与原 `ipMatch` 一致，退化为字面量比较
+                try set.literals.append(allocator, rule);
+                continue;
+            }
+            if (std.mem.indexOfScalar(u8, rule, '*') != null) {
+                try set.wildcards.append(allocator, rule);
+                continue;
+            }
+            if (parseIpv4(rule)) |v| {
+                try set.exact.put(allocator, v, {});
+            } else {
+                try set.literals.append(allocator, rule);
+            }
+        }
+        return set;
+    }
+
+    pub fn isEmpty(self: *const IpSet) bool {
+        return !self.any and self.exact.count() == 0 and self.cidrs.items.len == 0 and
+            self.wildcards.items.len == 0 and self.literals.items.len == 0;
+    }
+
+    /// 命中判定（语义与逐条 `ipMatch` 一致）。
+    pub fn matches(self: *const IpSet, ip_in: []const u8) bool {
+        const ip = trimList(ip_in);
+        if (ip.len == 0) return false;
+        if (self.any) return true;
+
+        if (parseIpv4(ip)) |v| {
+            if (self.exact.count() > 0 and self.exact.contains(v)) return true;
+            for (self.cidrs.items) |c| {
+                if ((v & c.mask) == c.network) return true;
+            }
+        }
+        for (self.literals.items) |l| {
+            if (eqIgnoreCase(ip, l)) return true;
+        }
+        for (self.wildcards.items) |w| {
+            if (wildcardMatch(ip, w)) return true;
+        }
+        return false;
+    }
+
+    pub fn deinit(self: *IpSet, allocator: std.mem.Allocator) void {
+        self.exact.deinit(allocator);
+        self.cidrs.deinit(allocator);
+        self.wildcards.deinit(allocator);
+        self.literals.deinit(allocator);
+        self.* = .{};
+    }
+};
+
 test "stripPort 口径" {
     const t = std.testing;
     try t.expectEqualStrings("192.168.1.5", stripPort("192.168.1.5:51234"));
@@ -309,6 +410,51 @@ test "IP 列表混合分隔符" {
     try std.testing.expect(ipInList("172.16.9.9", list));
     try std.testing.expect(ipInList("203.0.113.9", list));
     try std.testing.expect(!ipInList("8.8.8.8", list));
+}
+
+test "IpSet 预编译与逐条 ipMatch 等价" {
+    const rules = [_][]const u8{
+        "192.168.1.100",
+        "10.0.0.0/8",
+        "172.16.*.*",
+        "203.0.113.9/32",
+        "0.0.0.0/0",
+        "example.local",
+        "   ", // 空规则忽略
+        "198.51.100.1/notanumber", // 非法 CIDR → 字面量比较
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const set = try IpSet.build(arena.allocator(), &rules);
+
+    const ips = [_][]const u8{
+        "192.168.1.100",
+        "192.168.1.101",
+        "10.5.5.5",
+        "11.5.5.5",
+        "172.16.9.9",
+        "203.0.113.9",
+        "8.8.8.8",
+        "",
+        "example.local",
+        "::1",
+        "198.51.100.1/notanumber",
+    };
+    for (ips) |ip| {
+        var want = false;
+        for (rules) |r| {
+            if (ipMatch(ip, r)) {
+                want = true;
+                break;
+            }
+        }
+        try std.testing.expectEqual(want, set.matches(ip));
+    }
+
+    const any_set = try IpSet.build(arena.allocator(), &.{"*"});
+    try std.testing.expect(any_set.matches("8.8.8.8"));
+    try std.testing.expect(any_set.matches("::1"));
+    try std.testing.expect(!any_set.isEmpty());
 }
 
 test "回环判定" {

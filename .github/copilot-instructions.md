@@ -16,9 +16,10 @@
 
 ```powershell
 zig version            # 0.17.0（WinGet）或 0.17.1（VS Code Zig 扩展托管），两者均已验证
-zig build test         # 单元测试（基线 49 项，必须全绿）
+zig build test         # 单元测试（基线 52 项，必须全绿）
 zig build              # 编译库 + 示例
 zig build demo         # 起演示站点 127.0.0.1:18080（用 examples/waf_demo.zig 顶部注释的 curl 验证）
+zig build bench -Doptimize=ReleaseFast   # 性能基准（100 万次判定 / 100 万条名单）
 ```
 
 依赖：`build.zig.zon` 里 `zzig = { .path = "../zzig" }`（`G:\Code\Zig\zzig`）。
@@ -54,7 +55,7 @@ zig build demo         # 起演示站点 127.0.0.1:18080（用 examples/waf_demo
 7. **失败日志三要素**：做什么 + 为什么失败 + 关键上下文（路径/端口/错误名/片段）；禁止只写「操作失败」。
 8. **两类接入层边界**（不要混用）：路由中间件只覆盖**已匹配路由**；未匹配路径（`/.env`、`/x.php`）靠 `ServerGuard` 早拒。
    早拒层拿不到对端地址（zzig 视图限制）→ IP 名单/CC 在路由层做，`ip==""` 时不做 CC 计数。
-9. **验证门槛**：改动后 `zig build test` 必须全绿（通过数不得低于基线 49）；行为改动同时更新 `docs/设计说明.md` 的对照表。
+9. **验证门槛**：改动后 `zig build test` 必须全绿（通过数不得低于基线 52）；行为改动同时更新 `docs/设计说明.md` 的对照表。
 10. **提交信息一律中文**，用 `git commit -F <UTF-8 文件>`（不要 `-m`，PS 5.1 会转 GBK）；
     GitHub 直连超时用 `git -c http.curloptResolve=github.com:443:140.82.112.3 <cmd>`。
 

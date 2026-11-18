@@ -167,11 +167,13 @@ pub fn percentDecodeInto(
     input: []const u8,
     plus_as_space: bool,
 ) !void {
+    // 解码后长度必然 ≤ 输入长度（`%XX` 3→1、`+` 1→1）：一次预留，避免逐字节增长
+    try out.ensureUnusedCapacity(allocator, input.len);
     var i: usize = 0;
     while (i < input.len) {
         const c = input[i];
         if (c == '+' and plus_as_space) {
-            try out.append(allocator, ' ');
+            out.appendAssumeCapacity(' ');
             i += 1;
             continue;
         }
@@ -179,12 +181,12 @@ pub fn percentDecodeInto(
             const hi = hexVal(input[i + 1]);
             const lo = hexVal(input[i + 2]);
             if (hi != null and lo != null) {
-                try out.append(allocator, (hi.? << 4) | lo.?);
+                out.appendAssumeCapacity((hi.? << 4) | lo.?);
                 i += 3;
                 continue;
             }
         }
-        try out.append(allocator, c);
+        out.appendAssumeCapacity(c);
         i += 1;
     }
 }
@@ -214,6 +216,11 @@ pub fn normalizeLowerBytes(
     parts: []const []const u8,
 ) !void {
     out.clearRetainingCapacity();
+    // 规范化只会缩短（折叠空白）或等长（小写 / 去重编码）：一次预留总长即可
+    var total: usize = 0;
+    for (parts) |seg| total += seg.len;
+    try out.ensureTotalCapacity(allocator, total);
+
     var last_space = true;
     for (parts) |seg| {
         var i: usize = 0;
@@ -222,11 +229,11 @@ pub fn normalizeLowerBytes(
             if (b < 0x80) {
                 if (std.ascii.isWhitespace(b)) {
                     if (!last_space) {
-                        try out.append(allocator, ' ');
+                        out.appendAssumeCapacity(' ');
                         last_space = true;
                     }
                 } else {
-                    try out.append(allocator, std.ascii.toLower(b));
+                    out.appendAssumeCapacity(std.ascii.toLower(b));
                     last_space = false;
                 }
                 i += 1;
@@ -234,7 +241,7 @@ pub fn normalizeLowerBytes(
             }
             const seq_len = std.unicode.utf8ByteSequenceLength(b) catch 0;
             if (seq_len == 0 or i + seq_len > seg.len) {
-                try out.append(allocator, b);
+                out.appendAssumeCapacity(b);
                 last_space = false;
                 i += 1;
                 continue;
@@ -242,11 +249,11 @@ pub fn normalizeLowerBytes(
             const cp = std.unicode.utf8Decode(seg[i .. i + seq_len]) catch 0;
             if (cp != 0 and isUnicodeSpace(cp)) {
                 if (!last_space) {
-                    try out.append(allocator, ' ');
+                    out.appendAssumeCapacity(' ');
                     last_space = true;
                 }
             } else {
-                try out.appendSlice(allocator, seg[i .. i + seq_len]);
+                out.appendSliceAssumeCapacity(seg[i .. i + seq_len]);
                 last_space = false;
             }
             i += seq_len;
@@ -295,27 +302,105 @@ pub fn normalizePartsInto(
         var twice: std.ArrayList(u8) = .empty;
         defer twice.deinit(allocator);
         try percentDecodeInto(allocator, &twice, scratch.decoded.items, true);
-        try scratch.decoded.append(allocator, ' ');
-        try scratch.decoded.appendSlice(allocator, twice.items);
+        try scratch.decoded.ensureUnusedCapacity(allocator, twice.items.len + 1);
+        scratch.decoded.appendAssumeCapacity(' ');
+        scratch.decoded.appendSliceAssumeCapacity(twice.items);
     }
     try normalizeLowerBytes(allocator, &scratch.norm, &.{scratch.decoded.items});
     return scratch.norm.items;
 }
 
-fn hitAny(text: []const u8, patterns: []const []const u8) bool {
-    for (patterns) |p| {
-        if (std.mem.indexOf(u8, text, p) != null) return true;
+/// 合并后的特征条目（编译期生成；`kind` 为类别位）。
+const PatEntry = struct {
+    first: u8,
+    second: u8,
+    text: []const u8,
+    kind: u8,
+};
+
+const PAT_TOTAL = sqli_patterns.len + xss_patterns.len + path_patterns.len + cmd_patterns.len;
+
+const pat_entries = blk: {
+    @setEvalBranchQuota(20_000);
+    var list: [PAT_TOTAL]PatEntry = undefined;
+    var n: usize = 0;
+    for (sqli_patterns) |p| {
+        list[n] = .{ .first = p[0], .second = p[1], .text = p, .kind = K_SQLI };
+        n += 1;
     }
-    return false;
-}
+    for (xss_patterns) |p| {
+        list[n] = .{ .first = p[0], .second = p[1], .text = p, .kind = K_XSS };
+        n += 1;
+    }
+    for (path_patterns) |p| {
+        list[n] = .{ .first = p[0], .second = p[1], .text = p, .kind = K_PATH };
+        n += 1;
+    }
+    for (cmd_patterns) |p| {
+        list[n] = .{ .first = p[0], .second = p[1], .text = p, .kind = K_CMD };
+        n += 1;
+    }
+    break :blk list;
+};
+
+/// 首字节分桶的特征索引：**一次线性扫描**替代 77 次 `indexOf`。
+///
+/// 为什么：旧实现每类调 `hitAny`，77 个 pattern 各做一次 `std.mem.indexOf`，
+/// 每次都对整段文本从头扫（64 字节文本实测约 6.8 µs/请求，几乎全是这部分）。
+/// 现在按「首字节 → 桶」把 77 条特征编进表，扫描时每个位置只查一次 256 项小表，
+/// 仅当首字节命中且**第二字节**也一致时才做一次等长比较；桶内条目数最多 10 条。
+///
+/// 与旧实现语义一致：任意位置命中即计入对应类别位；`mask` 限定查哪几类。
+const ScanIndex = struct {
+    const Range = struct { start: u16, end: u16 };
+
+    const table = blk: {
+        @setEvalBranchQuota(50_000);
+        var counts: [256]u16 = @splat(0);
+        for (pat_entries) |e| counts[e.first] += 1;
+        var ranges: [256]Range = undefined;
+        var acc: u16 = 0;
+        for (0..256) |c| {
+            ranges[c] = .{ .start = acc, .end = acc + counts[c] };
+            acc += counts[c];
+        }
+        var cursor: [256]u16 = @splat(0);
+        for (0..256) |c| cursor[c] = ranges[c].start;
+        var out: [PAT_TOTAL]PatEntry = undefined;
+        for (pat_entries) |e| {
+            out[cursor[e.first]] = e;
+            cursor[e.first] += 1;
+        }
+        break :blk .{ .entries = out, .ranges = ranges };
+    };
+
+    fn scan(text: []const u8, mask: u8) u8 {
+        if (text.len < 2) return 0;
+        var bits: u8 = 0;
+        const last = text.len - 1;
+        var i: usize = 0;
+        while (i < last) : (i += 1) {
+            const r = table.ranges[text[i]];
+            if (r.start == r.end) continue;
+            const second = text[i + 1];
+            var j: usize = r.start;
+            while (j < r.end) : (j += 1) {
+                const e = table.entries[j];
+                if (e.second != second) continue;
+                if (e.kind & mask == 0) continue;
+                if (e.text.len > text.len - i) continue;
+                if (std.mem.startsWith(u8, text[i..], e.text)) {
+                    bits |= e.kind;
+                    if (bits & mask == mask) return bits;
+                }
+            }
+        }
+        return bits;
+    }
+};
 
 fn bitsOf(text: []const u8, mask: u8) u8 {
-    var bits: u8 = 0;
-    if (mask & K_SQLI != 0 and hitAny(text, sqli_patterns[0..])) bits |= K_SQLI;
-    if (mask & K_PATH != 0 and hitAny(text, path_patterns[0..])) bits |= K_PATH;
-    if (mask & K_CMD != 0 and hitAny(text, cmd_patterns[0..])) bits |= K_CMD;
-    if (mask & K_XSS != 0 and hitAny(text, xss_patterns[0..])) bits |= K_XSS;
-    return bits;
+    return ScanIndex.scan(text, mask);
 }
 
 /// 扫描多段文本，返回命中的类别位（`mask` 限定只查哪几类）。
@@ -459,4 +544,51 @@ test "Scratch 复用不残留" {
     try std.testing.expect(first & K_SQLI != 0);
     const second = try scanAllBitsWith(a, &scratch, "/x", "q=hello", "");
     try std.testing.expectEqual(@as(u8, 0), second);
+}
+
+/// 对照实现：改造前「每组逐条 indexOf」的语义（只用于测试，保证新扫描器等价）。
+fn legacyHitAny(text: []const u8, patterns: []const []const u8) bool {
+    for (patterns) |p| {
+        if (std.mem.indexOf(u8, text, p) != null) return true;
+    }
+    return false;
+}
+
+fn legacyBitsOf(text: []const u8, mask: u8) u8 {
+    var bits: u8 = 0;
+    if (mask & K_SQLI != 0 and legacyHitAny(text, sqli_patterns[0..])) bits |= K_SQLI;
+    if (mask & K_PATH != 0 and legacyHitAny(text, path_patterns[0..])) bits |= K_PATH;
+    if (mask & K_CMD != 0 and legacyHitAny(text, cmd_patterns[0..])) bits |= K_CMD;
+    if (mask & K_XSS != 0 and legacyHitAny(text, xss_patterns[0..])) bits |= K_XSS;
+    return bits;
+}
+
+test "首字节索引扫描与逐条 indexOf 语义等价" {
+    const samples = [_][]const u8{
+        "",
+        "a",
+        "/api/orders?page=2&size=20",
+        "id=1' or 1=1--",
+        "q=1%27%20or%201%3D1--",
+        "q=<script>alert(1)</script>",
+        "/.env",
+        "/assets/app.js",
+        "path=../../etc/passwd",
+        "x=%2e%2e%2f",
+        ";cat /etc/passwd",
+        "\ncat /tmp/x",
+        "union all select * from users",
+        "javascript:alert(1)",
+        "select count(*) from t",
+        "normal text mentioning union and select separately",
+        "a or b",
+        "order by 1--",
+        "user-agent: Googlebot/2.1",
+        "\u{4e2d}\u{6587}\u{6d4b}\u{8bd5}",
+    };
+    for (samples) |s| {
+        try std.testing.expectEqual(legacyBitsOf(s, K_ALL), ScanIndex.scan(s, K_ALL));
+        try std.testing.expectEqual(legacyBitsOf(s, K_PATH), ScanIndex.scan(s, K_PATH));
+        try std.testing.expectEqual(legacyBitsOf(s, K_SQLI | K_XSS), ScanIndex.scan(s, K_SQLI | K_XSS));
+    }
 }
