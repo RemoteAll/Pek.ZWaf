@@ -85,7 +85,12 @@ pub const WafConfig = struct {
     /// 对非文本 Content-Type 的请求体也做扫描
     bodyScanAllTypes: bool = true,
     /// 直连对端是回环时采纳 `X-Forwarded-For`（反代后取真实 IP）
-    trustForwardedFor: bool = false,
+    /// 是否采纳反代转发头（`x-real-ip` / `x-forwarded-for` 末段）当客户端 IP。
+    ///
+    /// **默认开**：应用绝大多数跑在 nginx 之后；`resolveClientIp` 只在 TCP 对端是回环时才采纳，
+    /// 直连公网时对端不是回环 → 转发头一律忽略，所以默认开不降低安全性。
+    /// 如果反代与程序**不在同一主机**（容器 / 旁路部署），对端不是回环，需配 `trustedProxyPrefixes`。
+    trustForwardedFor: bool = true,
     /// C# 兼容规则集 JSON 文件（相对基础目录；空 = 不启用）
     rulesetFile: []const u8 = "",
 

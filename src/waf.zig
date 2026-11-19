@@ -577,14 +577,15 @@ pub const Waf = struct {
 
     /// 便捷：从 zzig HTTP 服务端请求视图做头阶段检查。
     ///
-    /// 局限（视图本身没有对端地址）：IP 名单 / CC 限速在这一层拿不到真实 IP；
-    /// 需要 IP 维度早拒时请用 [`checkHead`] 并显式传 `remote_addr`。
+    /// `zzig` 的 `RequestView.remote_addr` 已是**纯 IP**（如果是反代场景，已被 `trust_forwarded_for`
+    /// 换成了真实客户端 IP），所以 IP 名单 / CC 限速 / 回环豁免在这一层同样生效。
     pub fn checkHeadView(self: *Waf, view: zzig.http_server.RequestView, stage: *Stage) Verdict {
         return self.checkHead(.{
             .method = @tagName(view.method),
             .path = view.path,
             .query = view.query,
             .headers = view.headers,
+            .remote_addr = view.remote_addr,
         }, stage);
     }
 
