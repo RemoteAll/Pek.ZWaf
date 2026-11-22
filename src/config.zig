@@ -406,39 +406,87 @@ pub fn renderTemplate(a: std.mem.Allocator, cfg: WafConfig) ![]u8 {
     errdefer out.deinit(a);
 
     try out.appendSlice(a,
-        \\# Pek.ZWaf 配置（TOML；保存后自动热生效）
+        \\# Pek.ZWaf 配置（TOML；保存后自动热生效，改文件约 2 秒内加载）
         \\# 字段含义见 Pek.ZWaf README / docs/设计说明.md；可手工修改后保存。
         \\# 规则集（C# Pek.WAF 兼容）放在 rulesetFile 指向的 JSON 文件里。
         \\
+        \\# 总开关（false = 完全旁路，仅调试用；生产保持 true）
         \\
     );
     try out.print(a, "enable = {}\n", .{cfg.enable});
+    try out.appendSlice(a,
+        \\# 预设模式：adminApi（后台/API 从严）| publicSite（公开站点，放行搜索与 AI 抓取）
+        \\
+    );
     try out.print(a, "mode = \"{s}\"\n", .{cfg.mode});
+    try out.appendSlice(a,
+        \\# 空 User-Agent 是否拦截（扫描器常用空 UA；探活脚本请配 ipWhitelist）
+        \\
+    );
     try out.print(a, "blockEmptyUa = {}\n", .{cfg.blockEmptyUa});
+    try out.appendSlice(a,
+        \\# 对端是回环（127.0.0.1 / ::1）时整体放行。
+        \\# 生产建议 true（本机脚本/探活免检）；**写 WAF 测试时必须置 false**，否则回环用例等于没测
+        \\
+    );
     try out.print(a, "loopbackBypass = {}\n", .{cfg.loopbackBypass});
+    try out.appendSlice(a, "# IP 白名单 / 黑名单（精确 IP 或前缀，如 \"10.0.\"）\n");
     try appendStrList(&out, a, "ipWhitelist", cfg.ipWhitelist);
     try appendStrList(&out, a, "ipBlacklist", cfg.ipBlacklist);
+    try out.appendSlice(a, "# 额外放行 / 拦截的机器人标识（匹配 User-Agent 子串）\n");
     try appendStrList(&out, a, "extraAllowBots", cfg.extraAllowBots);
     try appendStrList(&out, a, "extraBlockBots", cfg.extraBlockBots);
+    try out.appendSlice(a, "# 放行搜索引擎 / GEO-AI 抓取器 / 社交链接预览（公开站点通常都开）\n");
     try out.print(a, "allowSearchBots = {}\n", .{cfg.allowSearchBots});
     try out.print(a, "allowAiBots = {}\n", .{cfg.allowAiBots});
     try out.print(a, "allowSocialPreviews = {}\n", .{cfg.allowSocialPreviews});
+    try out.appendSlice(a, "# 拦截恶意爬虫与扫描器（sqlmap / nikto 等 UA 特征）\n");
     try out.print(a, "blockMaliciousBots = {}\n", .{cfg.blockMaliciousBots});
+    try out.appendSlice(a,
+        \\# 敏感路径前缀：该前缀下禁止一切机器人，且攻击「监控」项自动升级为「拦截」（如 "/admin"）
+        \\
+    );
     try appendStrList(&out, a, "sensitivePrefixes", cfg.sensitivePrefixes);
+    try out.appendSlice(a,
+        \\# 接口级限流（按客户端 IP + 路由前缀，对齐 C# [RateValve(Policy = Policy.Ip, ...)]）。
+        \\# 写法："前缀:窗口内次数:窗口秒数"，例如
+        \\#   routeLimits = ["/api/client-ip/check:20:60", "/api/client-ip:10:60"]
+        \\# 规则：**最长前缀优先**（check 的规则先于 /api/client-ip 生效）；单条格式写错会被忽略。
+        \\# 注意：代码里的内存态规则（setForcedRouteLimits）优先于这里，面板保存不会清掉那部分。
+        \\# 性能：未命中任何前缀的请求只做 1~N 次字符串前缀比较，不计数、不加锁、不分配。
+        \\
+    );
     try appendRouteLimits(&out, a, cfg.routeLimits);
+    try out.appendSlice(a, "# 跳过攻击特征检测的路径前缀（本体就执行 SQL / 接收文件的管理端点）\n");
     try appendStrList(&out, a, "skipAttackPrefixes", cfg.skipAttackPrefixes);
+    try out.appendSlice(a, "# 跳过机器人拦截的路径前缀（机器对机器 API，调用方 UA 常是 curl / python-requests）\n");
     try appendStrList(&out, a, "skipBotPrefixes", cfg.skipBotPrefixes);
+    try out.appendSlice(a, "# 跨站来源校验（CSRF）：非安全方法校验 Sec-Fetch-Site / Origin\n");
     try out.print(a, "csrfGuard = {}\n", .{cfg.csrfGuard});
+    try out.appendSlice(a, "# 各类攻击的动作：block（拦截）| monitor（只记录）| off（不检测）\n");
     try out.print(a, "sqliAction = \"{s}\"\n", .{cfg.sqliAction});
     try out.print(a, "xssAction = \"{s}\"\n", .{cfg.xssAction});
     try out.print(a, "pathAction = \"{s}\"\n", .{cfg.pathAction});
     try out.print(a, "cmdAction = \"{s}\"\n", .{cfg.cmdAction});
+    try out.appendSlice(a,
+        \\# 全站 CC 限速（每 IP 首次命中起 60 秒窗口内的请求数；0 = 关闭）。
+        \\# 阈值过小会误伤缓存命中的高频正常调用 —— 定值前先算业务峰值
+        \\
+    );
     try out.print(a, "rateLimitPerMin = {d}\n", .{cfg.rateLimitPerMin});
+    try out.appendSlice(a, "# 拦截日志 / 详细日志（放行与监控命中，排障用，生产建议关）\n");
     try out.print(a, "logBlocked = {}\n", .{cfg.logBlocked});
     try out.print(a, "verbose = {}\n", .{cfg.verbose});
+    try out.appendSlice(a, "# 请求体扫描上限（字节；0 回退 16 KB）与「非文本 Content-Type 是否也扫」\n");
     try out.print(a, "bodyScanLimit = {d}\n", .{cfg.bodyScanLimit});
     try out.print(a, "bodyScanAllTypes = {}\n", .{cfg.bodyScanAllTypes});
+    try out.appendSlice(a,
+        \\# 对端是回环时是否采纳 X-Real-IP / X-Forwarded-For（末段）作为客户端 IP。
+        \\# 反代后必须为 true，否则 WAF 看到的是 127.0.0.1：黑名单、Top IP、CC 全部失真
+        \\
+    );
     try out.print(a, "trustForwardedFor = {}\n", .{cfg.trustForwardedFor});
+    try out.appendSlice(a, "# 自定义规则集文件（JSON；留空 = 不使用）\n");
     try out.print(a, "rulesetFile = \"{s}\"\n", .{cfg.rulesetFile});
     return out.toOwnedSlice(a);
 }
