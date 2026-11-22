@@ -221,79 +221,40 @@ pub fn loadExisting(io: std.Io, gpa: std.mem.Allocator, path: []const u8, preset
     return .{ .arena = arena, .config = cfg };
 }
 
-fn getBool(table: *zzig.config.toml.Table, key: []const u8) ?bool {
-    const v = table.get(key) orelse return null;
-    return switch (v) {
-        .boolean => |b| b,
-        else => null,
-    };
-}
-
-fn getInt(table: *zzig.config.toml.Table, key: []const u8) ?i64 {
-    const v = table.get(key) orelse return null;
-    return switch (v) {
-        .integer => |i| i,
-        else => null,
-    };
-}
-
-fn getStr(table: *zzig.config.toml.Table, key: []const u8) ?[]const u8 {
-    const v = table.get(key) orelse return null;
-    return switch (v) {
-        .string => |s| s,
-        else => null,
-    };
-}
-
-fn getStrList(a: std.mem.Allocator, table: *zzig.config.toml.Table, key: []const u8) !?[]const []const u8 {
-    const v = table.get(key) orelse return null;
-    return switch (v) {
-        .array => |items| blk: {
-            const out = try a.alloc([]const u8, items.len);
-            for (items, 0..) |item, i| {
-                out[i] = switch (item) {
-                    .string => |s| s,
-                    else => "",
-                };
-            }
-            break :blk out;
-        },
-        else => null,
-    };
-}
-
+/// 以**预设为起点**逐键覆盖（不用 `toml.decode`：它会从类型默认值起步，把调用方预设清空）。
+/// 取值助手统一用 `zzig.config.toml.get*`（大小写不敏感，键名写错大小写也能读到）。
 fn applyTable(a: std.mem.Allocator, cfg: *WafConfig, table: *zzig.config.toml.Table) !void {
-    if (getBool(table, "enable")) |v| cfg.enable = v;
-    if (getStr(table, "mode")) |v| cfg.mode = v;
-    if (getBool(table, "blockEmptyUa")) |v| cfg.blockEmptyUa = v;
-    if (getBool(table, "loopbackBypass")) |v| cfg.loopbackBypass = v;
-    if (try getStrList(a, table, "ipWhitelist")) |v| cfg.ipWhitelist = v;
-    if (try getStrList(a, table, "ipBlacklist")) |v| cfg.ipBlacklist = v;
-    if (try getStrList(a, table, "extraAllowBots")) |v| cfg.extraAllowBots = v;
-    if (try getStrList(a, table, "extraBlockBots")) |v| cfg.extraBlockBots = v;
-    if (getBool(table, "allowSearchBots")) |v| cfg.allowSearchBots = v;
-    if (getBool(table, "allowAiBots")) |v| cfg.allowAiBots = v;
-    if (getBool(table, "allowSocialPreviews")) |v| cfg.allowSocialPreviews = v;
-    if (getBool(table, "blockMaliciousBots")) |v| cfg.blockMaliciousBots = v;
-    if (try getStrList(a, table, "sensitivePrefixes")) |v| cfg.sensitivePrefixes = v;
-    if (try getStrList(a, table, "skipAttackPrefixes")) |v| cfg.skipAttackPrefixes = v;
-    if (try getStrList(a, table, "skipBotPrefixes")) |v| cfg.skipBotPrefixes = v;
-    if (getBool(table, "csrfGuard")) |v| cfg.csrfGuard = v;
-    if (getStr(table, "sqliAction")) |v| cfg.sqliAction = v;
-    if (getStr(table, "xssAction")) |v| cfg.xssAction = v;
-    if (getStr(table, "pathAction")) |v| cfg.pathAction = v;
-    if (getStr(table, "cmdAction")) |v| cfg.cmdAction = v;
-    if (getInt(table, "rateLimitPerMin")) |v| {
+    if (zzig.config.toml.getBool(table, "enable")) |v| cfg.enable = v;
+    if (zzig.config.toml.getStr(table, "mode")) |v| cfg.mode = v;
+    if (zzig.config.toml.getBool(table, "blockEmptyUa")) |v| cfg.blockEmptyUa = v;
+    if (zzig.config.toml.getBool(table, "loopbackBypass")) |v| cfg.loopbackBypass = v;
+    if (try zzig.config.toml.getStrList(a, table, "ipWhitelist")) |v| cfg.ipWhitelist = v;
+    if (try zzig.config.toml.getStrList(a, table, "ipBlacklist")) |v| cfg.ipBlacklist = v;
+    if (try zzig.config.toml.getStrList(a, table, "extraAllowBots")) |v| cfg.extraAllowBots = v;
+    if (try zzig.config.toml.getStrList(a, table, "extraBlockBots")) |v| cfg.extraBlockBots = v;
+    if (zzig.config.toml.getBool(table, "allowSearchBots")) |v| cfg.allowSearchBots = v;
+    if (zzig.config.toml.getBool(table, "allowAiBots")) |v| cfg.allowAiBots = v;
+    if (zzig.config.toml.getBool(table, "allowSocialPreviews")) |v| cfg.allowSocialPreviews = v;
+    if (zzig.config.toml.getBool(table, "blockMaliciousBots")) |v| cfg.blockMaliciousBots = v;
+    if (try zzig.config.toml.getStrList(a, table, "sensitivePrefixes")) |v| cfg.sensitivePrefixes = v;
+    if (try zzig.config.toml.getStrList(a, table, "skipAttackPrefixes")) |v| cfg.skipAttackPrefixes = v;
+    if (try zzig.config.toml.getStrList(a, table, "skipBotPrefixes")) |v| cfg.skipBotPrefixes = v;
+    if (zzig.config.toml.getBool(table, "csrfGuard")) |v| cfg.csrfGuard = v;
+    if (zzig.config.toml.getStr(table, "sqliAction")) |v| cfg.sqliAction = v;
+    if (zzig.config.toml.getStr(table, "xssAction")) |v| cfg.xssAction = v;
+    if (zzig.config.toml.getStr(table, "pathAction")) |v| cfg.pathAction = v;
+    if (zzig.config.toml.getStr(table, "cmdAction")) |v| cfg.cmdAction = v;
+    if (zzig.config.toml.getInt(table, "rateLimitPerMin")) |v| {
         if (v >= 0) cfg.rateLimitPerMin = @intCast(@min(v, std.math.maxInt(u32)));
     }
-    if (getBool(table, "logBlocked")) |v| cfg.logBlocked = v;
-    if (getBool(table, "verbose")) |v| cfg.verbose = v;
-    if (getInt(table, "bodyScanLimit")) |v| {
+    if (zzig.config.toml.getBool(table, "logBlocked")) |v| cfg.logBlocked = v;
+    if (zzig.config.toml.getBool(table, "verbose")) |v| cfg.verbose = v;
+    if (zzig.config.toml.getInt(table, "bodyScanLimit")) |v| {
         if (v >= 0) cfg.bodyScanLimit = @intCast(@min(v, std.math.maxInt(u32)));
     }
-    if (getBool(table, "bodyScanAllTypes")) |v| cfg.bodyScanAllTypes = v;
-    if (getBool(table, "trustForwardedFor")) |v| cfg.trustForwardedFor = v;
-    if (getStr(table, "rulesetFile")) |v| cfg.rulesetFile = v;
+    if (zzig.config.toml.getBool(table, "bodyScanAllTypes")) |v| cfg.bodyScanAllTypes = v;
+    if (zzig.config.toml.getBool(table, "trustForwardedFor")) |v| cfg.trustForwardedFor = v;
+    if (zzig.config.toml.getStr(table, "rulesetFile")) |v| cfg.rulesetFile = v;
 }
 
 /// 保存配置（自动建目录、写临时文件后 rename；内容带注释头）。
