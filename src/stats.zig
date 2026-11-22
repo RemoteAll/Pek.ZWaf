@@ -28,8 +28,6 @@ pub const BlockKind = enum {
     rule,
     csrf,
     cc,
-    /// 接口级限流（按 IP + 路由前缀，对齐 C# `[RateValve(Policy = Policy.Ip, ...)]`）
-    route_rate,
 
     /// 稳定标识（日志 / 前端展示 / 聚合键）。
     pub fn asStr(self: BlockKind) []const u8 {
@@ -48,7 +46,6 @@ pub const BlockKind = enum {
             .rule => "自定义规则",
             .csrf => "跨站请求",
             .cc => "CC 限流",
-            .route_rate => "接口限流",
         };
     }
 

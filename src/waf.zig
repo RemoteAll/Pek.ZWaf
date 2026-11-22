@@ -1,4 +1,4 @@
-//! WAF 核心：`Waf` 门面（决策链）、zzig 中间件装配、`Config/Waf.toml` 热重载。
+﻿//! WAF 核心：`Waf` 门面（决策链）、zzig 中间件装配、`Config/Waf.toml` 热重载。
 //!
 //! 检查顺序（首个命中短路，与 Rust `Pek.RWaf` 完全一致）：
 //! 1. 可信签名 → 总开关 → 回环豁免 → IP 黑名单 → IP 白名单
@@ -215,8 +215,6 @@ pub const Waf = struct {
     forced_skip_bot: []const []const u8 = &.{},
     /// 强制跳过攻击特征检测的路径前缀（内存态）
     forced_skip_attack: []const []const u8 = &.{},
-    /// 内存态接口级限流规则（优先于配置文件里的 `routeLimits`；面板保存配置不会清掉）。
-    forced_route_limits: []const config.RouteLimit = &.{},
     /// 是否在「直连对端是回环」时采纳 `X-Forwarded-For`
     trust_forwarded_for: bool = false,
 
@@ -300,7 +298,6 @@ pub const Waf = struct {
         self.gpa.free(self.base_dir);
         if (self.forced_skip_bot.len > 0) self.gpa.free(self.forced_skip_bot);
         if (self.forced_skip_attack.len > 0) self.gpa.free(self.forced_skip_attack);
-        if (self.forced_route_limits.len > 0) self.gpa.free(self.forced_route_limits);
         if (self.trusted_secret) |s| self.gpa.free(s);
         self.gpa.destroy(self);
     }
@@ -361,34 +358,6 @@ pub const Waf = struct {
         const copy = try self.gpa.dupe([]const u8, prefixes);
         if (self.forced_skip_attack.len > 0) self.gpa.free(self.forced_skip_attack);
         self.forced_skip_attack = copy;
-    }
-
-    /// 强制接口级限流规则（内存态；优先于配置文件的 `routeLimits`）。
-    ///
-    /// 用 `setForced*` 而不是只写配置：面板保存会把配置写全字段，容易把加固清掉；
-    /// 内存态规则让「关键接口限流」始终在位。
-    ///
-    /// 存入时按 **前缀长度降序**预排序：请求到来时只要命中第一条最长前缀就返回，
-    /// 不需要每次遍历全部规则去找「最长前缀」。
-    pub fn setForcedRouteLimits(self: *Waf, list: []const config.RouteLimit) !void {
-        if (self.forced_route_limits.len > 0) self.gpa.free(self.forced_route_limits);
-        self.forced_route_limits = &.{};
-        if (list.len == 0) return;
-        const copy = try self.gpa.alloc(config.RouteLimit, list.len);
-        for (list, 0..) |rule, i| {
-            copy[i] = .{
-                .prefix = try self.gpa.dupe(u8, rule.prefix),
-                .limit = rule.limit,
-                .window_ms = rule.window_ms,
-            };
-        }
-        const Less = struct {
-            fn less(_: void, a: config.RouteLimit, b: config.RouteLimit) bool {
-                return a.prefix.len > b.prefix.len;
-            }
-        };
-        std.mem.sort(config.RouteLimit, copy, {}, Less.less);
-        self.forced_route_limits = copy;
     }
 
     /// 是否在「直连对端是回环」时采纳 `X-Forwarded-For`（内存态）。
@@ -792,44 +761,11 @@ pub const Waf = struct {
             }
         }
 
-        // —— 接口级限流（按 IP + 路由前缀；对齐 C# `[RateValve(Policy = Policy.Ip, Limit, Duration)]`）——
-        // 与上面的全站 CC 互补：这里可以给单个接口定更严的阀值（登录 10 次/分、校验 20 次/分……）。
-        // 内存态 `forcedRouteLimits` 优先于配置文件；多规则命中时**最长前缀优先**
-        // （`/api/client-ip/check` 的规则先于 `/api/client-ip` 生效）。
-        if (count_request and ip.len > 0 and !wafreq.isStaticAsset(req.path)) {
-            if (self.checkRouteLimit(&cfg, ip, req.path)) |rule| {
-                return self.blockedWith(
-                    g,
-                    req,
-                    stage,
-                    429,
-                    .route_rate,
-                    "接口请求频率超限（{s} 每 {d} 秒 {d} 次）",
-                    .{ rule.prefix, rule.window_ms / 1000, rule.limit },
-                );
-            }
-        }
+        // —— 接口级限流：不在本文件做 ——
+        // 逐接口阀值由 `Throttle.guard()`（与 C# `[RateValve]` 对齐）在路由层负责，
+        // 本层只做全站粗粒 CC。两套限速不要混用，否则同一请求被计两遍。
 
         return .allow;
-    }
-
-    /// 接口级限流：内存态规则优先于配置文件规则；命中且超限时返回该规则（用于生成 429 文案）。
-    fn checkRouteLimit(self: *Waf, cfg: *const config.WafConfig, ip: []const u8, path: []const u8) ?config.RouteLimit {
-        const rule = pickRouteLimit(self.forced_route_limits, path) orelse
-            pickRouteLimit(cfg.routeLimits, path) orelse return null;
-        var key_buf: [512]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "{s}|{s}", .{ ip, rule.prefix }) catch ip;
-        const d = self.limiter.hit(key, rule.limit, rule.window_ms);
-        return if (d.allowed) null else rule;
-    }
-
-    /// 在规则集里挑一条（规则已按前缀长度**降序**存好：首个命中即最长前缀，O(1) 典型）。
-    fn pickRouteLimit(list: []const config.RouteLimit, path: []const u8) ?config.RouteLimit {
-        for (list) |rule| {
-            if (rule.limit == 0 or rule.prefix.len == 0) continue;
-            if (std.mem.startsWith(u8, path, rule.prefix)) return rule;
-        }
-        return null;
     }
 
     fn blockedWith(
@@ -1144,45 +1080,6 @@ test "跳过前缀：bot 与攻击检测各自独立" {
     // 强制豁免（内存态）同样生效
     try waf.setForcedSkipBotPrefixes(&.{"/api"});
     try testing.expect(waf.run(&reqOf("/api/y", "curl/8.0", "8.8.8.8"), &stage, false).isAllow());
-}
-
-test "接口级限流：按 IP + 路由前缀（最长前缀优先），超限 429" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var cfg = WafConfig.adminApi();
-    cfg.rateLimitPerMin = 0; // 关掉全站 CC，单独验证接口级
-    cfg.routeLimits = &.{
-        // 注意顺序：`pickRouteLimit` 依赖「前缀长度降序」（配置文件解析时已排好；
-        // 代码里手工构造时也要按降序写）
-        .{ .prefix = "/api/client-ip/check", .limit = 2, .window_ms = 60_000 },
-        .{ .prefix = "/api/client-ip", .limit = 10, .window_ms = 60_000 },
-    };
-    const waf = try testWaf(&arena, cfg);
-    defer waf.deinit();
-
-    var stage = Stage{};
-    defer stage.deinit(waf.gpa);
-
-    // `/api/client-ip/check` 命中更严的 2 次/分（最长前缀优先）。
-    // 第三参数 `true` = 请求层（会计数）；头阶段调用传 `false`，限流**不在那一层计数**（避免双计）。
-    try testing.expect(waf.run(&reqOf("/api/client-ip/check", "Mozilla/5.0", "7.7.7.7"), &stage, true).isAllow());
-    try testing.expect(waf.run(&reqOf("/api/client-ip/check", "Mozilla/5.0", "7.7.7.7"), &stage, true).isAllow());
-    const v = waf.run(&reqOf("/api/client-ip/check", "Mozilla/5.0", "7.7.7.7"), &stage, true);
-    try testing.expectEqual(@as(u16, 429), v.blocked.status);
-
-    // 头阶段（`count_request = false`）不计数：同一 IP 再走 5 次仍放行
-    var i: usize = 0;
-    while (i < 5) : (i += 1) {
-        try testing.expect(waf.run(&reqOf("/api/client-ip/check", "Mozilla/5.0", "7.7.7.7"), &stage, false).isAllow());
-    }
-
-    // 父前缀 `/api/client-ip`（10 次/分）不受子规则已用次数影响
-    var j: usize = 0;
-    while (j < 5) : (j += 1) {
-        try testing.expect(waf.run(&reqOf("/api/client-ip", "Mozilla/5.0", "7.7.7.7"), &stage, true).isAllow());
-    }
-    // 按 IP 分桶：另一个 IP 不受前一 IP 的计数影响
-    try testing.expect(waf.run(&reqOf("/api/client-ip/check", "Mozilla/5.0", "6.6.6.6"), &stage, true).isAllow());
 }
 
 test "CC 限速与静态资源豁免" {

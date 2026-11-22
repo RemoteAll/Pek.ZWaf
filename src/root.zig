@@ -29,7 +29,6 @@ pub const BotKind = bots.BotKind;
 pub const AttackKind = attack.AttackKind;
 pub const WafRequest = wafreq.WafRequest;
 pub const WafConfig = config.WafConfig;
-pub const RouteLimit = config.RouteLimit;
 pub const WafMode = config.Mode;
 pub const Action = config.Action;
 pub const WafStats = stats.WafStats;

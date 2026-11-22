@@ -207,6 +207,11 @@ pub const Throttle = struct {
     file_path: ?[]const u8 = null,
     user_identity_hook: ?*const fn (*const zzig.web.router.Ctx) ?[]const u8 = null,
     client_ip_hook: ?*const fn (zzig.web.router.Request) []const u8 = null,
+    /// `guard()` 创建的路由守卫（归本引擎所有，`deinit` 时统一释放）。
+    ///
+    /// 不交给消费方逐个 `Guard.free`：路由通常在 `mount` 里一次性注册，
+    /// 漏释放就是几个常驻小泄漏，且每个消费方都会忘。
+    guards: std.ArrayList(*Guard) = .empty,
 
     /// 以内存配置构建（规则写在代码里；无文件热重载）。
     pub fn init(gpa: std.mem.Allocator, io: std.Io, cfg: ThrottleConfig) !*Throttle {
@@ -249,6 +254,8 @@ pub const Throttle = struct {
     }
 
     pub fn deinit(self: *Throttle) void {
+        for (self.guards.items) |g| g.free();
+        self.guards.deinit(self.gpa);
         self.gen.unref(self.gpa);
         self.limiter.deinit();
         if (self.file_path) |p| self.gpa.free(p);
@@ -469,12 +476,13 @@ pub const Throttle = struct {
 
     /// 包裹单个路由处理器（规则写在代码里，不必进配置文件）。
     ///
-    /// 返回的 `Handler` 内部持有一份规则副本（用 `gpa` 分配），
-    /// 不再使用时调用 [`Guard.free`] 释放。
+    /// 返回的 `Handler` 由本引擎持有并在 `deinit` 时自动释放，调用方不必手动 `Guard.free`。
     pub fn guard(self: *Throttle, rule: ThrottleRule, handler: zzig.web.router.Handler) !zzig.web.router.Handler {
         const g = try self.gpa.create(Guard);
         errdefer self.gpa.destroy(g);
         g.* = .{ .throttle = self, .rule = try dupRule(self.gpa, rule), .handler = handler };
+        errdefer freeRule(self.gpa, g.rule);
+        try self.guards.append(self.gpa, g);
         return .{ .ctx = g, .call = guardInvoke };
     }
 };
@@ -921,8 +929,6 @@ test "guard 包裹单个处理器" {
         }
     }.h);
     const wrapped = try throttle.guard(ThrottleRule.new("GET", "/g", &.{RateValve.ip(1, 60)}), handler);
-    const g: *Guard = @ptrCast(@alignCast(wrapped.ctx.?));
-    defer g.free();
 
     var c = try buildCtx(a, "GET", "/g", "7.7.7.7", &.{});
     defer c.deinit();
