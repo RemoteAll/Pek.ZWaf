@@ -1,0 +1,23 @@
+test
++- run test
+   +- compile test debug native 1 errors
+src\stats.zig:61:66: error: no field named 'fields' in struct 'lang.Type.Enum'
+pub const block_kind_count: usize = @typeInfo(BlockKind).@"enum".fields.len;
+                                                                 ^~~~~~
+C:\Users\qcjxb\AppData\Local\Microsoft\WinGet\Packages\zig.zig_Microsoft.Winget.Source_8wekyb3d8bbwe\zig-x86_64-windows-0.17.1\lib\std\lang.zig:807:22: note: struct declared here
+    pub const Enum = struct {
+                     ^~~~~~
+referenced by:
+    stats.WafStats: src\stats.zig:113:15
+    init: src\stats.zig:119:19
+    4 reference(s) hidden; use '-freference-trace=6' to see all references
+error: 1 compilation errors
+failed command: "C:\\Users\\qcjxb\\AppData\\Local\\Microsoft\\WinGet\\Packages\\zig.zig_Microsoft.Winget.Source_8wekyb3d8bbwe\\zig-x86_64-windows-0.17.1\\zig.exe" test -Odebug --dep zzig "-Mroot=src\\root.zig" "-Mzzig=../zzig\\src\\zzig.zig" --cache-dir .zig-cache --global-cache-dir "C:\\Users\\qcjxb\\AppData\\Local\\zig" --build-root . --name test --zig-lib-dir "C:\\Users\\qcjxb\\AppData\\Local\\Microsoft\\WinGet\\Packages\\zig.zig_Microsoft.Winget.Source_8wekyb3d8bbwe\\zig-x86_64-windows-0.17.1\\lib\\" --listen=-
+
+Build Summary: 0/3 steps succeeded (1 failed)
+test transitive failure
++- run test transitive failure
+   +- compile test debug native 1 errors
+
+error: the following build command exited with code 1:
+C:\Users\qcjxb\AppData\Local\zig\o\e4099869a96975dfccdb577de7993fcd\maker.exe build --zig-lib=C:\Users\qcjxb\AppData\Local\Microsoft\WinGet\Packages\zig.zig_Microsoft.Winget.Source_8wekyb3d8bbwe\zig-x86_64-windows-0.17.1\lib --zig=C:\Users\qcjxb\AppData\Local\Microsoft\WinGet\Packages\zig.zig_Microsoft.Winget.Source_8wekyb3d8bbwe\zig-x86_64-windows-0.17.1\zig.exe --global-cache=C:\Users\qcjxb\AppData\Local\zig --seed=0xe0dcd7a test

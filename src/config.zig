@@ -76,6 +76,12 @@ pub const WafConfig = struct {
     cmdAction: []const u8 = "block",
     /// CC 限速（每 IP 首次命中起 60 秒窗口内的请求数；0 = 关闭）
     rateLimitPerMin: u32 = 300,
+    /// 接口级限流（按 **IP + 路由前缀**，对齐 C# `[RateValve(Policy = Policy.Ip, Limit, Duration)]`）。
+    ///
+    /// 与 `rateLimitPerMin`（全站 CC，粒度粗）不同：这里可以给单个接口单独定阀值，
+    /// 例如 `POST /api/client-ip` 10 次/分、`check` 20 次/分、`probe/report` 60 次/分。
+    /// 匹配规则：按 **最长前缀优先**（`/api/client-ip/check` 先于 `/api/client-ip`）。
+    routeLimits: []const RouteLimit = &.{},
     /// 拦截日志
     logBlocked: bool = true,
     /// 详细日志（记录放行/监控命中）
@@ -135,6 +141,19 @@ pub const WafConfig = struct {
     }
 };
 
+/// 单条接口级限流规则。
+///
+/// TOML 写法：`routeLimits = ["/api/client-ip:10:60", "/api/client-ip/check:20:60"]`
+/// （`前缀:窗口内次数:窗口秒数`）；解析后以结构体形式使用。
+pub const RouteLimit = struct {
+    /// 路由前缀（按前缀匹配，建议以 `/` 开头）
+    prefix: []const u8,
+    /// 窗口内最大次数（0 = 该条不生效）
+    limit: u32,
+    /// 窗口长度（毫秒）
+    window_ms: u64 = 60_000,
+};
+
 /// 加载结果：配置 + 持有配置字符串的 arena。
 pub const Loaded = struct {
     arena: std.heap.ArenaAllocator,
@@ -162,6 +181,56 @@ fn dupeList(a: std.mem.Allocator, list: []const []const u8) ![]const []const u8 
     const out = try a.alloc([]const u8, list.len);
     for (list, 0..) |item, i| out[i] = try dupeStr(a, item);
     return out;
+}
+
+fn cloneRouteLimits(a: std.mem.Allocator, list: []const RouteLimit) ![]const RouteLimit {
+    if (list.len == 0) return &.{};
+    const out = try a.alloc(RouteLimit, list.len);
+    for (list, 0..) |item, i| {
+        out[i] = .{ .prefix = try dupeStr(a, item.prefix), .limit = item.limit, .window_ms = item.window_ms };
+    }
+    return out;
+}
+
+/// 解析 `"前缀:次数:窗口秒"` 列表（格式不对的条目直接跳过，不让一条写错就整份配置加载失败）。
+///
+/// **输出按前缀长度降序**：运行期 `pickRouteLimit` 依赖这个顺序做「首个命中即最长前缀」，
+/// 把排序成本放在这里（配置加载/保存时一次），请求路径上零排序、零额外分配。
+fn parseRouteLimits(a: std.mem.Allocator, items: []const []const u8) ![]const RouteLimit {
+    var list: std.ArrayList(RouteLimit) = .empty;
+    errdefer list.deinit(a);
+    for (items) |raw| {
+        const text = std.mem.trim(u8, raw, " \t\r\n");
+        if (text.len == 0) continue;
+        const last = std.mem.lastIndexOfScalar(u8, text, ':') orelse continue;
+        const prev = std.mem.lastIndexOfScalar(u8, text[0..last], ':') orelse continue;
+        const prefix = std.mem.trim(u8, text[0..prev], " ");
+        const limit = std.fmt.parseInt(u32, std.mem.trim(u8, text[prev + 1 .. last], " "), 10) catch continue;
+        const secs = std.fmt.parseInt(u64, std.mem.trim(u8, text[last + 1 ..], " "), 10) catch continue;
+        if (prefix.len == 0 or limit == 0 or secs == 0) continue;
+        try list.append(a, .{ .prefix = try dupeStr(a, prefix), .limit = limit, .window_ms = secs * 1000 });
+    }
+    const Less = struct {
+        fn less(_: void, x: RouteLimit, y: RouteLimit) bool {
+            return x.prefix.len > y.prefix.len;
+        }
+    };
+    std.mem.sort(RouteLimit, list.items, {}, Less.less);
+    return list.toOwnedSlice(a);
+}
+
+fn appendRouteLimits(out: *std.ArrayList(u8), a: std.mem.Allocator, list: []const RouteLimit) !void {
+    try out.appendSlice(a, "routeLimits = [");
+    for (list, 0..) |item, i| {
+        if (i > 0) try out.appendSlice(a, ", ");
+        try out.append(a, '"');
+        try out.appendSlice(a, item.prefix);
+        const tail = try std.fmt.allocPrint(a, ":{d}:{d}", .{ item.limit, item.window_ms / 1000 });
+        defer a.free(tail);
+        try out.appendSlice(a, tail);
+        try out.append(a, '"');
+    }
+    try out.appendSlice(a, "]\n");
 }
 
 /// 深拷贝配置到 `a`（面板保存 / 内存态配置用：调用方切片可能随时失效）。
@@ -275,6 +344,7 @@ fn applyTable(a: std.mem.Allocator, cfg: *WafConfig, table: *zzig.config.toml.Ta
     if (getBool(table, "allowSocialPreviews")) |v| cfg.allowSocialPreviews = v;
     if (getBool(table, "blockMaliciousBots")) |v| cfg.blockMaliciousBots = v;
     if (try getStrList(a, table, "sensitivePrefixes")) |v| cfg.sensitivePrefixes = v;
+    if (try getStrList(a, table, "routeLimits")) |v| cfg.routeLimits = try parseRouteLimits(a, v);
     if (try getStrList(a, table, "skipAttackPrefixes")) |v| cfg.skipAttackPrefixes = v;
     if (try getStrList(a, table, "skipBotPrefixes")) |v| cfg.skipBotPrefixes = v;
     if (getBool(table, "csrfGuard")) |v| cfg.csrfGuard = v;
@@ -355,6 +425,7 @@ pub fn renderTemplate(a: std.mem.Allocator, cfg: WafConfig) ![]u8 {
     try out.print(a, "allowSocialPreviews = {}\n", .{cfg.allowSocialPreviews});
     try out.print(a, "blockMaliciousBots = {}\n", .{cfg.blockMaliciousBots});
     try appendStrList(&out, a, "sensitivePrefixes", cfg.sensitivePrefixes);
+    try appendRouteLimits(&out, a, cfg.routeLimits);
     try appendStrList(&out, a, "skipAttackPrefixes", cfg.skipAttackPrefixes);
     try appendStrList(&out, a, "skipBotPrefixes", cfg.skipBotPrefixes);
     try out.print(a, "csrfGuard = {}\n", .{cfg.csrfGuard});

@@ -28,6 +28,8 @@ pub const BlockKind = enum {
     rule,
     csrf,
     cc,
+    /// 接口级限流（按 IP + 路由前缀，对齐 C# `[RateValve(Policy = Policy.Ip, ...)]`）
+    route_rate,
 
     /// 稳定标识（日志 / 前端展示 / 聚合键）。
     pub fn asStr(self: BlockKind) []const u8 {
@@ -46,6 +48,7 @@ pub const BlockKind = enum {
             .rule => "自定义规则",
             .csrf => "跨站请求",
             .cc => "CC 限流",
+            .route_rate => "接口限流",
         };
     }
 
@@ -53,6 +56,9 @@ pub const BlockKind = enum {
         return @backingInt(self);
     }
 };
+
+/// 拦截类型数量（= `BlockKind` 变体数；新增变体时自动跟随，不用再改数组长度与循环上界）。
+pub const block_kind_count: usize = std.enums.values(BlockKind).len;
 
 const Bucket = struct {
     minute: u64 = 0,
@@ -85,7 +91,7 @@ pub const Snapshot = struct {
     blocked_ratio: f64 = 0,
     last_minute: u64 = 0,
     last_5_minutes: u64 = 0,
-    reasons: [9]ReasonCount = @splat(.{}),
+    reasons: [block_kind_count]ReasonCount = @splat(.{}),
     reason_len: usize = 0,
     ips: [TOP_IP_CAPACITY]IpKey = @splat(.{}),
     ip_len: usize = 0,
@@ -104,7 +110,7 @@ pub const WafStats = struct {
     since: i64,
     total: std.atomic.Value(u64) = .init(0),
     blocked: std.atomic.Value(u64) = .init(0),
-    by_kind: [9]std.atomic.Value(u64) = @splat(.init(0)),
+    by_kind: [block_kind_count]std.atomic.Value(u64) = @splat(.init(0)),
     mutex: zzig.compat.Mutex = .{},
     window: [WINDOW_BUCKETS]Bucket = @splat(.{}),
     top: [TOP_IP_CAPACITY]IpKey = @splat(.{}),
@@ -200,7 +206,7 @@ pub const WafStats = struct {
             }
         }
 
-        for (0..9) |i| {
+        for (0..block_kind_count) |i| {
             const kind: BlockKind = @fromBackingInt(@intCast(i));
             const count = self.by_kind[i].load(.monotonic);
             if (count == 0) continue;

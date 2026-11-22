@@ -1,0 +1,29 @@
+test
++- run test 52 pass, 1 crash (53 total)
+error: 'waf.test.接口级限流：按 IP + 路由前缀（最长前缀优先），超限 429' exited with code 3 with stderr:
+       thread 22136 panic: access of union field 'blocked' while field 'allow' is active
+       G:\Code\Zig\Pek.ZWaf\src\waf.zig:1170:45: 0x7ff7c49135d9 in test.接口级限流：按 IP + 路由前缀（最长前缀优先），超限 429 (test_zcu.obj)
+           try testing.expectEqual(@as(u16, 429), v.blocked.status);
+                                                   ^
+       C:\Users\qcjxb\AppData\Local\Microsoft\WinGet\Packages\zig.zig_Microsoft.Winget.Source_8wekyb3d8bbwe\zig-x86_64-windows-0.17.1\lib\compiler\test_runner.zig:143:68: 0x7ff7c47da3ce in mainServer (test_zcu.obj)
+                       const status: TestResults.Status = if (test_fn.func()) |v| s: {
+                                                                          ^
+       C:\Users\qcjxb\AppData\Local\Microsoft\WinGet\Packages\zig.zig_Microsoft.Winget.Source_8wekyb3d8bbwe\zig-x86_64-windows-0.17.1\lib\compiler\test_runner.zig:72:26: 0x7ff7c47da9fb in main (test_zcu.obj)
+               return mainServer(init) catch |err| panic("internal test runner failure: {t}", .{err});
+                                ^
+       C:\Users\qcjxb\AppData\Local\Microsoft\WinGet\Packages\zig.zig_Microsoft.Winget.Source_8wekyb3d8bbwe\zig-x86_64-windows-0.17.1\lib\std\start.zig:789: 0x7ff7c47d894d in callMain (test_zcu.obj)
+           if (fn_info.param_types[0].? == std.process.Init.Minimal) return wrapMain(root.main(.{
+       
+       C:\Users\qcjxb\AppData\Local\Microsoft\WinGet\Packages\zig.zig_Microsoft.Winget.Source_8wekyb3d8bbwe\zig-x86_64-windows-0.17.1\lib\std\start.zig:576:17: 0x7ff7c47d894d in WinStartup (test_zcu.obj)
+               callMain(std.os.windows.peb().ProcessParameters.CommandLine.slice(), .global),
+                       ^
+       ???:?:?: 0x7ffb78c0dda6 in ??? (KERNEL32.DLL)
+       ???:?:?: 0x7ffb79759c6b in ??? (ntdll.dll)
+failed command: ".\\.zig-cache\\o\\cd642b6fa167b339e2d6a28906b88ba0\\test.exe" "--cache-dir=.\\.zig-cache" --seed=0x221b6073 --listen=-
+
+Build Summary: 1/3 steps succeeded (1 failed); 52/53 tests passed (1 crashed)
+test transitive failure
++- run test 52 pass, 1 crash (53 total)
+
+error: the following build command exited with code 1:
+C:\Users\qcjxb\AppData\Local\zig\o\e4099869a96975dfccdb577de7993fcd\maker.exe build --zig-lib=C:\Users\qcjxb\AppData\Local\Microsoft\WinGet\Packages\zig.zig_Microsoft.Winget.Source_8wekyb3d8bbwe\zig-x86_64-windows-0.17.1\lib --zig=C:\Users\qcjxb\AppData\Local\Microsoft\WinGet\Packages\zig.zig_Microsoft.Winget.Source_8wekyb3d8bbwe\zig-x86_64-windows-0.17.1\zig.exe --global-cache=C:\Users\qcjxb\AppData\Local\zig --seed=0x221b6073 test
