@@ -1,4 +1,4 @@
-﻿//! WAF 核心：`Waf` 门面（决策链）、zzig 中间件装配、`Config/Waf.toml` 热重载。
+//! WAF 核心：`Waf` 门面（决策链）、zzig 中间件装配、`Config/Waf.toml` 热重载。
 //!
 //! 检查顺序（首个命中短路，与 Rust `Pek.RWaf` 完全一致）：
 //! 1. 可信签名 → 总开关 → 回环豁免 → IP 黑名单 → IP 白名单
@@ -594,47 +594,6 @@ pub const Waf = struct {
         return matchesAnyPrefix(self.forced_skip_attack, path);
     }
 
-    /// 协议层硬限制：方法白名单（405）/ URL 长度（414）/ 非上传请求体上限（413）。
-    ///
-    /// 为什么放在最前面：这三类不是「业务规则」而是**协议/资源边界**——
-    /// 扫描器常拿 `TRACE`/`PROPFIND`/超长 URL/超大 `Content-Length` 试探，
-    /// 在读 body 之前就按标准状态码拒掉，既省资源又能让上游反代/监控正确归类。
-    fn protocolReject(self: *Waf, g: *const Gen, cfg: *const WafConfig, req: *const WafRequest, stage: *Stage) ?Verdict {
-        // 1) 方法白名单（HTTP 方法大小写敏感，不做忽略大小写匹配）
-        if (cfg.allowedMethods.len > 0) {
-            var ok = false;
-            for (cfg.allowedMethods) |m| {
-                if (std.mem.eql(u8, m, req.method)) {
-                    ok = true;
-                    break;
-                }
-            }
-            if (!ok) {
-                var buf: [24]u8 = undefined;
-                return self.blockedWith(g, req, stage, 405, .protocol, "不允许的请求方法：{s}", .{brief(&buf, req.method)});
-            }
-        }
-
-        // 2) URL 长度（path + '?' + query）
-        if (cfg.maxUrlLength > 0) {
-            const url_len = req.path.len + (if (req.query.len > 0) req.query.len + 1 else 0);
-            if (url_len > cfg.maxUrlLength) {
-                return self.blockedWith(g, req, stage, 414, .protocol, "URL 过长（{d} > {d} 字节）", .{ url_len, cfg.maxUrlLength });
-            }
-        }
-
-        // 3) 非上传路径的请求体上限：只看声明的 `Content-Length`，**不读 body**
-        if (cfg.maxBodyNormal > 0 and !matchesAnyPrefix(cfg.uploadPrefixes, req.path)) {
-            if (headerOf(req.headers, "content-length")) |cl| {
-                const declared = std.fmt.parseInt(u64, std.mem.trim(u8, cl, " \t"), 10) catch 0;
-                if (declared > cfg.maxBodyNormal) {
-                    return self.blockedWith(g, req, stage, 413, .protocol, "请求体过大（声明 {d} > 上限 {d} 字节）", .{ declared, cfg.maxBodyNormal });
-                }
-            }
-        }
-        return null;
-    }
-
     fn skipsBot(self: *Waf, cfg: *const WafConfig, path: []const u8) bool {
         if (matchesAnyPrefix(cfg.skipBotPrefixes, path)) return true;
         return matchesAnyPrefix(self.forced_skip_bot, path);
@@ -654,10 +613,6 @@ pub const Waf = struct {
 
         if (count_request) self.stats.recordRequest();
         if (!cfg.enable) return .allow;
-
-        // —— 协议层硬限制（Web 规范默认值）——
-        // 放在 IP 名单与回环豁免**之前**：格式本身就不合规的请求，不该被任何豁免放行。
-        if (self.protocolReject(g, &cfg, req, stage)) |v| return v;
 
         const ip = std.mem.trim(u8, req.remote_ip, " \t");
 
@@ -926,24 +881,10 @@ pub const ServerGuard = struct {
 
     fn invoke(raw: *anyopaque, req: zzig.http_server.RequestView, arena: std.mem.Allocator) anyerror!zzig.http_server.Reply {
         const self: *ServerGuard = @ptrCast(@alignCast(raw));
-        // 池化复用（分配失败时降级为栈上 Stage，不影响拦截）
-        const stage = self.waf.stages.acquire(self.waf.gpa) orelse return self.invokeWith(req, arena, null);
-        defer self.waf.stages.release(self.waf.gpa, stage);
-        return self.invokeWith(req, arena, stage);
-    }
-
-    fn invokeWith(self: *ServerGuard, req: zzig.http_server.RequestView, arena: std.mem.Allocator, pooled: ?*Stage) anyerror!zzig.http_server.Reply {
-        var local = Stage{};
-        const stage: *Stage = blk: {
-            if (pooled) |s| break :blk s;
-            break :blk &local;
-        };
-        defer if (pooled == null) local.deinit(self.waf.gpa);
-
-        switch (self.waf.checkHeadView(req, stage)) {
-            .allow => return self.inner(self.inner_ctx, req, arena),
-            .blocked => |b| return blockedReply(b),
-        }
+        // **不在这里再跑一遍 `checkHead`**：`install` 注册的 `guardHead` 已经在读 body 之前
+        // 做过同一套判定（协议 / IP / UA / 爬虫 / 路径与查询串攻击特征），重复跑等于
+        // 每个正常请求付两遍扫描成本。请求体级规则由路由中间件（`w.middleware()`）负责。
+        return self.inner(self.inner_ctx, req, arena);
     }
 };
 
@@ -1165,43 +1106,6 @@ test "跳过前缀：bot 与攻击检测各自独立" {
     // 强制豁免（内存态）同样生效
     try waf.setForcedSkipBotPrefixes(&.{"/api"});
     try testing.expect(waf.run(&reqOf("/api/y", "curl/8.0", "8.8.8.8"), &stage, false).isAllow());
-}
-
-test "协议层硬限制：方法 / URL 长度 / body 上限" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    var cfg = WafConfig.adminApi();
-    cfg.maxUrlLength = 64;
-    cfg.maxBodyNormal = 1024;
-    const waf = try testWaf(&arena, cfg);
-    defer waf.deinit();
-
-    var stage = Stage{};
-    defer stage.deinit(waf.gpa);
-
-    // 1) TRACE 不在白名单 → 405
-    var r = WafRequest{ .path = "/", .method = "TRACE", .user_agent = "Mozilla/5.0", .remote_ip = "8.8.8.8" };
-    try testing.expectEqual(@as(u16, 405), waf.run(&r, &stage, false).blocked.status);
-
-    // 2) 正常方法放行
-    r.method = "GET";
-    try testing.expect(waf.run(&r, &stage, false).isAllow());
-
-    // 3) URL 超长 → 414（path 65 字节 > 64）
-    var long_path_buf: [96]u8 = undefined;
-    @memset(&long_path_buf, 'a');
-    long_path_buf[0] = '/';
-    r = WafRequest{ .path = &long_path_buf, .method = "GET", .user_agent = "Mozilla/5.0", .remote_ip = "8.8.8.8" };
-    try testing.expectEqual(@as(u16, 414), waf.run(&r, &stage, false).blocked.status);
-
-    // 4) 非上传路径声明 4 KB body → 413（只看 Content-Length，不读 body）
-    const big_headers = [_]std.http.Header{.{ .name = "content-length", .value = "4096" }};
-    r = WafRequest{ .path = "/admin/config/save", .method = "POST", .user_agent = "Mozilla/5.0", .remote_ip = "8.8.8.8", .headers = &big_headers };
-    try testing.expectEqual(@as(u16, 413), waf.run(&r, &stage, false).blocked.status);
-
-    // 5) 上传前缀不受 maxBodyNormal 限制
-    r.path = "/upload/big.bin";
-    try testing.expect(waf.run(&r, &stage, false).isAllow());
 }
 
 test "CC 限速与静态资源豁免" {

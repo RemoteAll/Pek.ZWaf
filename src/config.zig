@@ -94,22 +94,6 @@ pub const WafConfig = struct {
     /// C# 兼容规则集 JSON 文件（相对基础目录；空 = 不启用）
     rulesetFile: []const u8 = "",
 
-    // ————— 协议层硬限制（按 Web 规范给的默认值；**0 / 空 = 不限制**）—————
-    /// 允许的 HTTP 方法（**大小写敏感**，HTTP 规范如此）。不在表内一律 405。
-    ///
-    /// 默认不包含 `TRACE` / `TRACK`（XST 跨站追踪攻击）、`PROPFIND` 等 WebDAV 方法。
-    /// 默认含 `OPTIONS`：CORS 预检与部分反代探活要用。
-    allowedMethods: []const []const u8 = &.{ "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS" },
-    /// URL（path + `?` + query）长度上限；超限 414。浏览器与反代普遍 8 KB，取 4 KB 有余量
-    maxUrlLength: usize = 4096,
-    /// 非上传路径的 `Content-Length` 上限（字节）；超限 413。
-    ///
-    /// 取 1 MB 而非规范推荐的 256 KB：生态里后台富文本/设置提交可能到几百 KB，
-    /// 256 KB 会在正常使用下误伤。真正的大文件走 `uploadPrefixes`（受服务端 `max_body` 约束）。
-    maxBodyNormal: usize = 1024 * 1024,
-    /// 上传路径前缀（不做 `maxBodyNormal` 限制，交给服务端全局 `max_body`）
-    uploadPrefixes: []const []const u8 = &.{ "/upload", "/fileuploader", "/api/upload" },
-
     pub fn modeKind(self: WafConfig) Mode {
         return if (eq(self.mode, "publicSite")) .public_site else .admin_api;
     }
@@ -280,14 +264,6 @@ fn applyTable(a: std.mem.Allocator, cfg: *WafConfig, table: *zzig.config.toml.Ta
     if (zzig.config.toml.getBool(table, "bodyScanAllTypes")) |v| cfg.bodyScanAllTypes = v;
     if (zzig.config.toml.getBool(table, "trustForwardedFor")) |v| cfg.trustForwardedFor = v;
     if (zzig.config.toml.getStr(table, "rulesetFile")) |v| cfg.rulesetFile = v;
-    if (try zzig.config.toml.getStrList(a, table, "allowedMethods")) |v| cfg.allowedMethods = v;
-    if (zzig.config.toml.getInt(table, "maxUrlLength")) |v| {
-        if (v >= 0) cfg.maxUrlLength = @intCast(@min(v, std.math.maxInt(u32)));
-    }
-    if (zzig.config.toml.getInt(table, "maxBodyNormal")) |v| {
-        if (v >= 0) cfg.maxBodyNormal = @intCast(@min(v, std.math.maxInt(u32)));
-    }
-    if (try zzig.config.toml.getStrList(a, table, "uploadPrefixes")) |v| cfg.uploadPrefixes = v;
 }
 
 /// 保存配置（自动建目录、写临时文件后 rename；内容带注释头）。
@@ -349,17 +325,6 @@ pub fn renderTemplate(a: std.mem.Allocator, cfg: WafConfig) ![]u8 {
         .{ .key = "blockMaliciousBots", .doc = &.{"拦截恶意爬虫与扫描器（sqlmap / nikto 等 UA 特征）"}, .value = .{ .boolean = cfg.blockMaliciousBots } },
         .{ .key = "sensitivePrefixes", .doc = &.{"敏感路径前缀：该前缀下禁止一切机器人，且攻击「监控」项自动升级为「拦截」（如 \"/admin\"）"}, .value = .{ .string_list = cfg.sensitivePrefixes } },
         .{ .key = "skipAttackPrefixes", .doc = &.{"跳过攻击特征检测的路径前缀（本体就执行 SQL / 接收文件的管理端点）"}, .value = .{ .string_list = cfg.skipAttackPrefixes } },
-        .{ .key = "skipBotPrefixes", .doc = &.{"跳过机器人拦截的路径前缀（机器对机器 API，调用方 UA 常是 curl / python-requests）"}, .value = .{ .string_list = cfg.skipBotPrefixes } },
-        .{ .key = "allowedMethods", .doc = &.{
-            "允许的 HTTP 方法（大小写敏感）；不在表内一律 405。",
-            "默认不含 TRACE / TRACK（XST 跨站追踪）与 WebDAV 系方法；空数组 = 不限制。",
-        }, .value = .{ .string_list = cfg.allowedMethods } },
-        .{ .key = "maxUrlLength", .doc = &.{"URL（path + query）长度上限，超限 414；0 = 不限制"}, .value = .{ .integer = @intCast(cfg.maxUrlLength) } },
-        .{ .key = "maxBodyNormal", .doc = &.{
-            "非上传路径的 Content-Length 上限（字节），超限 413（早拒，不读 body）；0 = 不限制。",
-            "取 1 MB：后台富文本/设置提交可能到几百 KB，256 KB 会误伤。",
-        }, .value = .{ .integer = @intCast(cfg.maxBodyNormal) } },
-        .{ .key = "uploadPrefixes", .doc = &.{"上传路径前缀：不受 maxBodyNormal 限制，由服务端全局 max_body 约束"}, .value = .{ .string_list = cfg.uploadPrefixes } },
         .{ .key = "csrfGuard", .doc = &.{"跨站来源校验（CSRF）：非安全方法校验 Sec-Fetch-Site / Origin"}, .value = .{ .boolean = cfg.csrfGuard } },
         .{ .key = "sqliAction", .doc = &.{"SQL 注入动作：block（拦截）| monitor（只记录）| off（不检测）"}, .value = .{ .string = cfg.sqliAction } },
         .{ .key = "xssAction", .doc = &.{"XSS 动作（同上取值）"}, .value = .{ .string = cfg.xssAction } },
