@@ -391,7 +391,8 @@ pub const Waf = struct {
                 config.save(self.io, self.gpa, path, current) catch {};
                 return;
             }
-            zzig.Logger.warn("[WAF] 配置热重载失败（保留旧配置）：{s}", .{@errorName(err)});
+            // 常见原因写进日志：编辑器/脚本给文件加了 UTF-8 BOM、或改坏了 TOML 语法。
+            zzig.Logger.warn("[WAF] 配置热重载失败（保留旧配置）：{s}（文件 {s}；请检查是否带 UTF-8 BOM 或 TOML 语法有误）", .{ @errorName(err), path });
             return;
         };
         defer loaded.deinit();
@@ -593,6 +594,47 @@ pub const Waf = struct {
         return matchesAnyPrefix(self.forced_skip_attack, path);
     }
 
+    /// 协议层硬限制：方法白名单（405）/ URL 长度（414）/ 非上传请求体上限（413）。
+    ///
+    /// 为什么放在最前面：这三类不是「业务规则」而是**协议/资源边界**——
+    /// 扫描器常拿 `TRACE`/`PROPFIND`/超长 URL/超大 `Content-Length` 试探，
+    /// 在读 body 之前就按标准状态码拒掉，既省资源又能让上游反代/监控正确归类。
+    fn protocolReject(self: *Waf, g: *const Gen, cfg: *const WafConfig, req: *const WafRequest, stage: *Stage) ?Verdict {
+        // 1) 方法白名单（HTTP 方法大小写敏感，不做忽略大小写匹配）
+        if (cfg.allowedMethods.len > 0) {
+            var ok = false;
+            for (cfg.allowedMethods) |m| {
+                if (std.mem.eql(u8, m, req.method)) {
+                    ok = true;
+                    break;
+                }
+            }
+            if (!ok) {
+                var buf: [24]u8 = undefined;
+                return self.blockedWith(g, req, stage, 405, .protocol, "不允许的请求方法：{s}", .{brief(&buf, req.method)});
+            }
+        }
+
+        // 2) URL 长度（path + '?' + query）
+        if (cfg.maxUrlLength > 0) {
+            const url_len = req.path.len + (if (req.query.len > 0) req.query.len + 1 else 0);
+            if (url_len > cfg.maxUrlLength) {
+                return self.blockedWith(g, req, stage, 414, .protocol, "URL 过长（{d} > {d} 字节）", .{ url_len, cfg.maxUrlLength });
+            }
+        }
+
+        // 3) 非上传路径的请求体上限：只看声明的 `Content-Length`，**不读 body**
+        if (cfg.maxBodyNormal > 0 and !matchesAnyPrefix(cfg.uploadPrefixes, req.path)) {
+            if (headerOf(req.headers, "content-length")) |cl| {
+                const declared = std.fmt.parseInt(u64, std.mem.trim(u8, cl, " \t"), 10) catch 0;
+                if (declared > cfg.maxBodyNormal) {
+                    return self.blockedWith(g, req, stage, 413, .protocol, "请求体过大（声明 {d} > 上限 {d} 字节）", .{ declared, cfg.maxBodyNormal });
+                }
+            }
+        }
+        return null;
+    }
+
     fn skipsBot(self: *Waf, cfg: *const WafConfig, path: []const u8) bool {
         if (matchesAnyPrefix(cfg.skipBotPrefixes, path)) return true;
         return matchesAnyPrefix(self.forced_skip_bot, path);
@@ -612,6 +654,10 @@ pub const Waf = struct {
 
         if (count_request) self.stats.recordRequest();
         if (!cfg.enable) return .allow;
+
+        // —— 协议层硬限制（Web 规范默认值）——
+        // 放在 IP 名单与回环豁免**之前**：格式本身就不合规的请求，不该被任何豁免放行。
+        if (self.protocolReject(g, &cfg, req, stage)) |v| return v;
 
         const ip = std.mem.trim(u8, req.remote_ip, " \t");
 
@@ -754,7 +800,10 @@ pub const Waf = struct {
         // —— CC 限速（放行类机器人豁免；静态资源不计数）——
         // 客户端 IP 未知时**不计数**：否则所有未知来源共用一个桶，一个客户端就能把全站配额打满
         // （zzig `http_server` 的请求视图目前不带对端地址，走 `App` 集成时会遇到这种情况）。
-        if (cfg.rateLimitPerMin > 0 and ip.len > 0 and !friendly_bot and !wafreq.isStaticAsset(req.path)) {
+        //
+        // **只在 `count_request`（即路由/handler 阶段）计数**：装了头阶段早拒后同一请求会过两遍
+        // `decide`，两处各计一次等于把阈值腰斩（300/分 实际变成 150/分）。
+        if (count_request and cfg.rateLimitPerMin > 0 and ip.len > 0 and !friendly_bot and !wafreq.isStaticAsset(req.path)) {
             const d = self.limiter.hit(ip, cfg.rateLimitPerMin, 60_000);
             if (!d.allowed) {
                 return self.blockedWith(g, req, stage, 429, .cc, "请求频率超限（{d} 次/分钟）", .{cfg.rateLimitPerMin});
@@ -841,10 +890,38 @@ pub const ServerGuard = struct {
         _ = gpa;
     }
 
-    /// 把自己装进 zzig HTTP 服务端（替换 ctx/handler）。
+    /// 把自己装进 zzig HTTP 服务端（替换 ctx/handler），**并注册头阶段早拒钩子**。
+    ///
+    /// 两处都需要：zzig 的服务端是「读头 → **读 body** → 调 handler」，
+    /// 只挂在 handler 上等于 body 已经读完了 —— 超大 `Content-Length`、扫描器 UA
+    /// 这类本可以不收 body 就拒的请求会白白占用带宽与内存。
     pub fn install(self: *ServerGuard, srv: *zzig.http_server.Server) void {
         srv.ctx = @ptrCast(self);
         srv.handler = invoke;
+        srv.head_guard = .{ .ctx = @ptrCast(self), .call = guardHead };
+    }
+
+    /// 头阶段（body 未读）：命中就回拒绝响应，放行返回 `null`。
+    fn guardHead(
+        raw: *anyopaque,
+        head: zzig.http_server.HeadView,
+        arena: std.mem.Allocator,
+    ) anyerror!?zzig.http_server.Reply {
+        _ = arena;
+        const self: *ServerGuard = @ptrCast(@alignCast(raw));
+        const stage = self.waf.stages.acquire(self.waf.gpa) orelse return null;
+        defer self.waf.stages.release(self.waf.gpa, stage);
+        const verdict = self.waf.checkHead(.{
+            .method = head.method,
+            .path = head.path,
+            .query = head.query,
+            .headers = head.headers,
+            .remote_addr = head.remote_addr,
+        }, stage);
+        return switch (verdict) {
+            .allow => null,
+            .blocked => |b| blockedReply(b),
+        };
     }
 
     fn invoke(raw: *anyopaque, req: zzig.http_server.RequestView, arena: std.mem.Allocator) anyerror!zzig.http_server.Reply {
@@ -865,18 +942,27 @@ pub const ServerGuard = struct {
 
         switch (self.waf.checkHeadView(req, stage)) {
             .allow => return self.inner(self.inner_ctx, req, arena),
-            .blocked => |b| {
-                const status: std.http.Status = if (b.status == 429) .too_many_requests else .forbidden;
-                return .{
-                    .status = status,
-                    .body = if (b.status == 429) "请求过于频繁，请稍后再试" else "请求被安全策略拦截",
-                    .content_type = "text/plain; charset=utf-8",
-                    .headers = if (b.status == 429) &limited_headers else &blocked_headers,
-                };
-            },
+            .blocked => |b| return blockedReply(b),
         }
     }
 };
+
+/// 拦截结论 → HTTP 响应（早拒钩子与 handler 阶段共用，避免两处映射不一致）。
+fn blockedReply(b: Verdict.Blocked) zzig.http_server.Reply {
+    const status: std.http.Status = switch (b.status) {
+        405 => .method_not_allowed,
+        413 => .payload_too_large,
+        414 => .uri_too_long,
+        429 => .too_many_requests,
+        else => .forbidden,
+    };
+    return .{
+        .status = status,
+        .body = if (b.status == 429) "请求过于频繁，请稍后再试" else "请求被安全策略拦截",
+        .content_type = "text/plain; charset=utf-8",
+        .headers = if (b.status == 429) &limited_headers else &blocked_headers,
+    };
+}
 
 /// 被拦响应的固定头（静态存储：响应可能在中间件返回后才被发送）。
 const blocked_headers = [_]std.http.Header{
@@ -917,19 +1003,18 @@ fn middlewareWith(
     switch (waf.checkCtx(c, stage)) {
         .allow => return next.run(c),
         .blocked => |b| {
-            if (b.status == 429) {
-                return .{
-                    .status = .too_many_requests,
-                    .body = "请求过于频繁，请稍后再试",
-                    .content_type = "text/plain; charset=utf-8",
-                    .headers = &limited_headers,
-                };
-            }
+            const status: std.http.Status = switch (b.status) {
+                405 => .method_not_allowed,
+                413 => .payload_too_large,
+                414 => .uri_too_long,
+                429 => .too_many_requests,
+                else => .forbidden,
+            };
             return .{
-                .status = .forbidden,
-                .body = "请求被安全策略拦截",
+                .status = status,
+                .body = if (b.status == 429) "请求过于频繁，请稍后再试" else "请求被安全策略拦截",
                 .content_type = "text/plain; charset=utf-8",
-                .headers = &blocked_headers,
+                .headers = if (b.status == 429) &limited_headers else &blocked_headers,
             };
         },
     }
@@ -1082,6 +1167,43 @@ test "跳过前缀：bot 与攻击检测各自独立" {
     try testing.expect(waf.run(&reqOf("/api/y", "curl/8.0", "8.8.8.8"), &stage, false).isAllow());
 }
 
+test "协议层硬限制：方法 / URL 长度 / body 上限" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var cfg = WafConfig.adminApi();
+    cfg.maxUrlLength = 64;
+    cfg.maxBodyNormal = 1024;
+    const waf = try testWaf(&arena, cfg);
+    defer waf.deinit();
+
+    var stage = Stage{};
+    defer stage.deinit(waf.gpa);
+
+    // 1) TRACE 不在白名单 → 405
+    var r = WafRequest{ .path = "/", .method = "TRACE", .user_agent = "Mozilla/5.0", .remote_ip = "8.8.8.8" };
+    try testing.expectEqual(@as(u16, 405), waf.run(&r, &stage, false).blocked.status);
+
+    // 2) 正常方法放行
+    r.method = "GET";
+    try testing.expect(waf.run(&r, &stage, false).isAllow());
+
+    // 3) URL 超长 → 414（path 65 字节 > 64）
+    var long_path_buf: [96]u8 = undefined;
+    @memset(&long_path_buf, 'a');
+    long_path_buf[0] = '/';
+    r = WafRequest{ .path = &long_path_buf, .method = "GET", .user_agent = "Mozilla/5.0", .remote_ip = "8.8.8.8" };
+    try testing.expectEqual(@as(u16, 414), waf.run(&r, &stage, false).blocked.status);
+
+    // 4) 非上传路径声明 4 KB body → 413（只看 Content-Length，不读 body）
+    const big_headers = [_]std.http.Header{.{ .name = "content-length", .value = "4096" }};
+    r = WafRequest{ .path = "/admin/config/save", .method = "POST", .user_agent = "Mozilla/5.0", .remote_ip = "8.8.8.8", .headers = &big_headers };
+    try testing.expectEqual(@as(u16, 413), waf.run(&r, &stage, false).blocked.status);
+
+    // 5) 上传前缀不受 maxBodyNormal 限制
+    r.path = "/upload/big.bin";
+    try testing.expect(waf.run(&r, &stage, false).isAllow());
+}
+
 test "CC 限速与静态资源豁免" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1093,15 +1215,21 @@ test "CC 限速与静态资源豁免" {
     var stage = Stage{};
     defer stage.deinit(waf.gpa);
 
+    // 头阶段（count_request=false）不占 CC 配额：同一请求会过两遍 decide，
+    // 两处都计数等于阈值腰斩（300/分 变 150/分）。
     try testing.expect(waf.run(&reqOf("/x", "Mozilla/5.0", "9.9.9.9"), &stage, false).isAllow());
     try testing.expect(waf.run(&reqOf("/x", "Mozilla/5.0", "9.9.9.9"), &stage, false).isAllow());
-    const v = waf.run(&reqOf("/x", "Mozilla/5.0", "9.9.9.9"), &stage, false);
+    try testing.expect(waf.run(&reqOf("/x", "Mozilla/5.0", "9.9.9.9"), &stage, false).isAllow());
+
+    try testing.expect(waf.run(&reqOf("/x", "Mozilla/5.0", "9.9.9.9"), &stage, true).isAllow());
+    try testing.expect(waf.run(&reqOf("/x", "Mozilla/5.0", "9.9.9.9"), &stage, true).isAllow());
+    const v = waf.run(&reqOf("/x", "Mozilla/5.0", "9.9.9.9"), &stage, true);
     try testing.expectEqual(@as(u16, 429), v.blocked.status);
 
     // 静态资源不计数
     var i: usize = 0;
     while (i < 10) : (i += 1) {
-        try testing.expect(waf.run(&reqOf("/assets/a.js", "Mozilla/5.0", "9.9.9.9"), &stage, false).isAllow());
+        try testing.expect(waf.run(&reqOf("/assets/a.js", "Mozilla/5.0", "9.9.9.9"), &stage, true).isAllow());
     }
 }
 

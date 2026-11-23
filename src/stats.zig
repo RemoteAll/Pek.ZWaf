@@ -28,6 +28,8 @@ pub const BlockKind = enum {
     rule,
     csrf,
     cc,
+    /// 协议层硬限制：方法不允许 / URL 过长 / 请求体超限（405 / 414 / 413）
+    protocol,
 
     /// 稳定标识（日志 / 前端展示 / 聚合键）。
     pub fn asStr(self: BlockKind) []const u8 {

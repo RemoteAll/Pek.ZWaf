@@ -94,6 +94,22 @@ pub const WafConfig = struct {
     /// C# 兼容规则集 JSON 文件（相对基础目录；空 = 不启用）
     rulesetFile: []const u8 = "",
 
+    // ————— 协议层硬限制（按 Web 规范给的默认值；**0 / 空 = 不限制**）—————
+    /// 允许的 HTTP 方法（**大小写敏感**，HTTP 规范如此）。不在表内一律 405。
+    ///
+    /// 默认不包含 `TRACE` / `TRACK`（XST 跨站追踪攻击）、`PROPFIND` 等 WebDAV 方法。
+    /// 默认含 `OPTIONS`：CORS 预检与部分反代探活要用。
+    allowedMethods: []const []const u8 = &.{ "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS" },
+    /// URL（path + `?` + query）长度上限；超限 414。浏览器与反代普遍 8 KB，取 4 KB 有余量
+    maxUrlLength: usize = 4096,
+    /// 非上传路径的 `Content-Length` 上限（字节）；超限 413。
+    ///
+    /// 取 1 MB 而非规范推荐的 256 KB：生态里后台富文本/设置提交可能到几百 KB，
+    /// 256 KB 会在正常使用下误伤。真正的大文件走 `uploadPrefixes`（受服务端 `max_body` 约束）。
+    maxBodyNormal: usize = 1024 * 1024,
+    /// 上传路径前缀（不做 `maxBodyNormal` 限制，交给服务端全局 `max_body`）
+    uploadPrefixes: []const []const u8 = &.{ "/upload", "/fileuploader", "/api/upload" },
+
     pub fn modeKind(self: WafConfig) Mode {
         return if (eq(self.mode, "publicSite")) .public_site else .admin_api;
     }
@@ -164,7 +180,6 @@ fn dupeList(a: std.mem.Allocator, list: []const []const u8) ![]const []const u8 
     return out;
 }
 
-
 /// 深拷贝配置到 `a`（面板保存 / 内存态配置用：调用方切片可能随时失效）。
 pub fn clone(a: std.mem.Allocator, cfg: WafConfig) !WafConfig {
     var out = cfg;
@@ -184,20 +199,30 @@ pub fn clone(a: std.mem.Allocator, cfg: WafConfig) !WafConfig {
     return out;
 }
 
+/// 剥 UTF-8 BOM。**Windows 记事本、PowerShell 5.1 的 `Set-Content -Encoding utf8`
+/// 都会在文件开头写 `EF BB BF`**，不剥会解析失败。
+///
+/// 2026-11-23 实测踩到：手工把 `loopbackBypass` 改成 `false` 时被写进 BOM，
+/// 热重载报 `InvalidToml` 并**保留旧配置**，于是「以为关掉了回环放行，其实没关」，
+/// 一整轮 WAF 测试全部假放行（空 UA / sqlmap 都返回 200）。
+fn stripBom(text: []const u8) []const u8 {
+    return if (std.mem.startsWith(u8, text, "\xEF\xBB\xBF")) text[3..] else text;
+}
+
 /// 从 `path` 加载；文件不存在时按 `preset` 生成模板并返回预设。
 pub fn loadOrCreate(io: std.Io, gpa: std.mem.Allocator, path: []const u8, preset: WafConfig) !Loaded {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
 
-    const text = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1024 * 1024)) catch |err| switch (err) {
+    const text = stripBom(std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1024 * 1024)) catch |err| switch (err) {
         error.FileNotFound => {
             const cfg = preset;
             save(io, a, path, cfg) catch {};
             return .{ .arena = arena, .config = cfg };
         },
         else => return err,
-    };
+    });
 
     const table = zzig.config.toml.parse(a, text) catch {
         // 解析失败：保留调用方预设（不静默清空），由门面负责告警
@@ -214,7 +239,7 @@ pub fn loadExisting(io: std.Io, gpa: std.mem.Allocator, path: []const u8, preset
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
-    const text = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1024 * 1024));
+    const text = stripBom(try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1024 * 1024)));
     const table = try zzig.config.toml.parse(a, text);
     var cfg = preset;
     try applyTable(a, &cfg, table);
@@ -255,6 +280,14 @@ fn applyTable(a: std.mem.Allocator, cfg: *WafConfig, table: *zzig.config.toml.Ta
     if (zzig.config.toml.getBool(table, "bodyScanAllTypes")) |v| cfg.bodyScanAllTypes = v;
     if (zzig.config.toml.getBool(table, "trustForwardedFor")) |v| cfg.trustForwardedFor = v;
     if (zzig.config.toml.getStr(table, "rulesetFile")) |v| cfg.rulesetFile = v;
+    if (try zzig.config.toml.getStrList(a, table, "allowedMethods")) |v| cfg.allowedMethods = v;
+    if (zzig.config.toml.getInt(table, "maxUrlLength")) |v| {
+        if (v >= 0) cfg.maxUrlLength = @intCast(@min(v, std.math.maxInt(u32)));
+    }
+    if (zzig.config.toml.getInt(table, "maxBodyNormal")) |v| {
+        if (v >= 0) cfg.maxBodyNormal = @intCast(@min(v, std.math.maxInt(u32)));
+    }
+    if (try zzig.config.toml.getStrList(a, table, "uploadPrefixes")) |v| cfg.uploadPrefixes = v;
 }
 
 /// 保存配置（自动建目录、写临时文件后 rename；内容带注释头）。
@@ -317,6 +350,16 @@ pub fn renderTemplate(a: std.mem.Allocator, cfg: WafConfig) ![]u8 {
         .{ .key = "sensitivePrefixes", .doc = &.{"敏感路径前缀：该前缀下禁止一切机器人，且攻击「监控」项自动升级为「拦截」（如 \"/admin\"）"}, .value = .{ .string_list = cfg.sensitivePrefixes } },
         .{ .key = "skipAttackPrefixes", .doc = &.{"跳过攻击特征检测的路径前缀（本体就执行 SQL / 接收文件的管理端点）"}, .value = .{ .string_list = cfg.skipAttackPrefixes } },
         .{ .key = "skipBotPrefixes", .doc = &.{"跳过机器人拦截的路径前缀（机器对机器 API，调用方 UA 常是 curl / python-requests）"}, .value = .{ .string_list = cfg.skipBotPrefixes } },
+        .{ .key = "allowedMethods", .doc = &.{
+            "允许的 HTTP 方法（大小写敏感）；不在表内一律 405。",
+            "默认不含 TRACE / TRACK（XST 跨站追踪）与 WebDAV 系方法；空数组 = 不限制。",
+        }, .value = .{ .string_list = cfg.allowedMethods } },
+        .{ .key = "maxUrlLength", .doc = &.{"URL（path + query）长度上限，超限 414；0 = 不限制"}, .value = .{ .integer = @intCast(cfg.maxUrlLength) } },
+        .{ .key = "maxBodyNormal", .doc = &.{
+            "非上传路径的 Content-Length 上限（字节），超限 413（早拒，不读 body）；0 = 不限制。",
+            "取 1 MB：后台富文本/设置提交可能到几百 KB，256 KB 会误伤。",
+        }, .value = .{ .integer = @intCast(cfg.maxBodyNormal) } },
+        .{ .key = "uploadPrefixes", .doc = &.{"上传路径前缀：不受 maxBodyNormal 限制，由服务端全局 max_body 约束"}, .value = .{ .string_list = cfg.uploadPrefixes } },
         .{ .key = "csrfGuard", .doc = &.{"跨站来源校验（CSRF）：非安全方法校验 Sec-Fetch-Site / Origin"}, .value = .{ .boolean = cfg.csrfGuard } },
         .{ .key = "sqliAction", .doc = &.{"SQL 注入动作：block（拦截）| monitor（只记录）| off（不检测）"}, .value = .{ .string = cfg.sqliAction } },
         .{ .key = "xssAction", .doc = &.{"XSS 动作（同上取值）"}, .value = .{ .string = cfg.xssAction } },
@@ -407,6 +450,34 @@ test "往返保存与读取（缺键继承预设）" {
     var third = try loadExisting(io, a, path, preset);
     defer third.deinit();
     try std.testing.expectEqual(@as(usize, 0), third.config.skipBotPrefixes.len);
+}
+
+test "读入时剥 UTF-8 BOM（Windows 记事本 / PS 5.1 会写 BOM）" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+    const base = try tempDir(a);
+    defer a.free(base);
+    defer cwd.deleteTree(io, base) catch {};
+    try cwd.createDirPath(io, base);
+
+    const path = try std.fs.path.join(a, &.{ base, CONFIG_REL });
+    defer a.free(path);
+    try cwd.createDirPath(io, std.fs.path.dirname(path).?);
+
+    // 文件头 EF BB BF + 一行真实配置：BOM 不剥会 parse 失败 → 静默保留预设（测试会红）
+    {
+        const file = try cwd.createFile(io, path, .{ .truncate = true });
+        defer file.close(io);
+        try file.writeStreamingAll(io, "\xEF\xBB\xBFenable = true\nloopbackBypass = false\n");
+    }
+
+    var preset = WafConfig.adminApi();
+    preset.loopbackBypass = true; // 预设与文件相反：读到 false 才证明文件生效
+    var loaded = try loadExisting(io, a, path, preset);
+    defer loaded.deinit();
+    try std.testing.expect(loaded.config.enable);
+    try std.testing.expect(!loaded.config.loopbackBypass);
 }
 
 test "模板渲染可被解析回同样配置" {
