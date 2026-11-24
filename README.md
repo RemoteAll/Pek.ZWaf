@@ -93,6 +93,7 @@ sensitivePrefixes = ["/admin"]
 **自定义**：`extraAllowBots` / `extraBlockBots`（UA 子串，大小写不敏感；放行优先）。
 
 > 机器对机器接口用 `skipBotPrefixes = ["/api"]`（只跳过 bot 判定，攻击特征/IP/CC 仍然生效）；
+> 无 Cookie 的机器接口还要配 `csrfSkipPrefixes = ["/api"]`（否则其它站点的页面/脚本调用会被跨站来源校验拦成 403）；
 > 已有 HMAC 签名的项目可用 `waf.setTrustedSecret(secret)` 复用该签名体系，无需新增凭据。
 
 ## 配置参考（`Config/Waf.toml`，camelCase）
@@ -111,6 +112,7 @@ sensitivePrefixes = ["/admin"]
 | `skipAttackPrefixes` | `[]` | 跳过攻击检测（在线 SQL / 文件管理等端点） |
 | `skipBotPrefixes` | `[]` | 跳过机器人拦截（机器对机器 API） |
 | `csrfGuard` | `true` | 跨站来源校验 |
+| `csrfSkipPrefixes` | `[]` | 跳过 CSRF 校验（无 Cookie 的机器接口；跨站调用是正常业务） |
 | `sqliAction` / `xssAction` / `pathAction` / `cmdAction` | `"block"` | 逐项动作：`off` / `monitor` / `block` |
 | `rateLimitPerMin` | `300` | CC 限速（0 = 关） |
 | `logBlocked` / `verbose` | `true` / `false` | 拦截日志 / 详细日志 |

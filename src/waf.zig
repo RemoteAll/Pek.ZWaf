@@ -215,6 +215,8 @@ pub const Waf = struct {
     forced_skip_bot: []const []const u8 = &.{},
     /// 强制跳过攻击特征检测的路径前缀（内存态）
     forced_skip_attack: []const []const u8 = &.{},
+    /// 强制跳过 CSRF 校验的路径前缀（内存态；无 Cookie 的机器接口用）
+    forced_skip_csrf: []const []const u8 = &.{},
     /// 是否在「直连对端是回环」时采纳 `X-Forwarded-For`
     trust_forwarded_for: bool = false,
 
@@ -298,6 +300,7 @@ pub const Waf = struct {
         self.gpa.free(self.base_dir);
         if (self.forced_skip_bot.len > 0) self.gpa.free(self.forced_skip_bot);
         if (self.forced_skip_attack.len > 0) self.gpa.free(self.forced_skip_attack);
+        if (self.forced_skip_csrf.len > 0) self.gpa.free(self.forced_skip_csrf);
         if (self.trusted_secret) |s| self.gpa.free(s);
         self.gpa.destroy(self);
     }
@@ -358,6 +361,16 @@ pub const Waf = struct {
         const copy = try self.gpa.dupe([]const u8, prefixes);
         if (self.forced_skip_attack.len > 0) self.gpa.free(self.forced_skip_attack);
         self.forced_skip_attack = copy;
+    }
+
+    /// 强制跳过 CSRF 校验的路径前缀（内存态）。
+    ///
+    /// 给「无 Cookie / 无会话的机器接口」用：这些接口不存在可被 CSRF 利用的凭证，
+    /// 跨站调用（其它站点的页面 / 脚本）是正常业务，不应当拦成 403。
+    pub fn setForcedSkipCsrfPrefixes(self: *Waf, prefixes: []const []const u8) !void {
+        const copy = try self.gpa.dupe([]const u8, prefixes);
+        if (self.forced_skip_csrf.len > 0) self.gpa.free(self.forced_skip_csrf);
+        self.forced_skip_csrf = copy;
     }
 
     /// 是否在「直连对端是回环」时采纳 `X-Forwarded-For`（内存态）。
@@ -520,8 +533,10 @@ pub const Waf = struct {
         var view = WafRequest.fromRouterRequest(req);
         view.remote_ip = self.resolveClientIp(req.remote_addr orelse "", req.header("x-forwarded-for"));
 
-        // 跨站来源校验（CSRF）先于回环豁免：浏览器跨站请求的源 IP 恰是回环
-        if (cfg.enable and cfg.csrfGuard) {
+        // 跨站来源校验（CSRF）先于回环豁免：浏览器跨站请求的源 IP 恰是回环。
+        // 无 Cookie 的机器接口（`csrfSkipPrefixes`）不做 CSRF：没有可被利用的凭证，
+        // 跨站调用是正常业务（2026-11-24 线上实测：其它站点页面调 /api 被拦成 403）。
+        if (cfg.enable and cfg.csrfGuard and !self.skipsCsrf(&cfg, view.path)) {
             if (csrfReason(view.method, req.header("sec-fetch-site") orelse "", req.header("origin") orelse "", req.header("host") orelse "")) |reason| {
                 return self.blockedWith(g, &view, stage, 403, .csrf, "{s}", .{reason});
             }
@@ -564,7 +579,7 @@ pub const Waf = struct {
         };
 
         const verdict = blk: {
-            if (cfg.enable and cfg.csrfGuard) {
+            if (cfg.enable and cfg.csrfGuard and !self.skipsCsrf(&cfg, head.path)) {
                 if (csrfReason(view.method, headerOf(head.headers, "sec-fetch-site") orelse "", headerOf(head.headers, "origin") orelse "", headerOf(head.headers, "host") orelse "")) |reason| {
                     break :blk self.blockedWith(g, &view, stage, 403, .csrf, "{s}", .{reason});
                 }
@@ -597,6 +612,11 @@ pub const Waf = struct {
     fn skipsBot(self: *Waf, cfg: *const WafConfig, path: []const u8) bool {
         if (matchesAnyPrefix(cfg.skipBotPrefixes, path)) return true;
         return matchesAnyPrefix(self.forced_skip_bot, path);
+    }
+
+    fn skipsCsrf(self: *Waf, cfg: *const WafConfig, path: []const u8) bool {
+        if (matchesAnyPrefix(cfg.csrfSkipPrefixes, path)) return true;
+        return matchesAnyPrefix(self.forced_skip_csrf, path);
     }
 
     /// 便捷入口（测试/内部）：自带引用计数。
@@ -1146,6 +1166,43 @@ test "CSRF 判定" {
     try testing.expect(csrfReason("POST", "", "https://evil.com", "example.com") != null);
     // 没有来源头（curl / 服务间调用）→ 放行
     try testing.expect(csrfReason("POST", "", "", "") == null);
+}
+
+test "CSRF 前缀豁免（无 Cookie 的机器接口不受跨站来源限制）" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var cfg = WafConfig.adminApi();
+    cfg.csrfSkipPrefixes = &.{"/api"};
+    const waf = try testWaf(&arena, cfg);
+    defer waf.deinit();
+
+    const headers = [_]std.http.Header{
+        .{ .name = "origin", .value = "https://other-site.example" },
+        .{ .name = "sec-fetch-site", .value = "cross-site" },
+    };
+
+    var stage = Stage{};
+    defer stage.deinit(waf.gpa);
+
+    // 机器接口：跨站放行（CSRF 检查在头阶段与路由阶段各有一处，这里测头阶段）
+    const api_head = HeadInput{
+        .method = "POST",
+        .path = "/api/client-ip/check",
+        .headers = &headers,
+        .remote_addr = "203.0.113.9",
+    };
+    try testing.expect(waf.checkHead(api_head, &stage).isAllow());
+
+    // 后台表单：跨站仍然拦（CSRF 只对无 Cookie 的接口豁免）
+    const admin_head = HeadInput{
+        .method = "POST",
+        .path = "/admin/config/updatebase",
+        .headers = &headers,
+        .remote_addr = "203.0.113.9",
+    };
+    const verdict = waf.checkHead(admin_head, &stage);
+    try testing.expect(!verdict.isAllow());
+    try testing.expectEqual(@as(u16, 403), verdict.blocked.status);
 }
 
 test "可信签名放行与伪造签名拦截" {

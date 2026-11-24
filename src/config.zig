@@ -66,6 +66,11 @@ pub const WafConfig = struct {
     skipBotPrefixes: []const []const u8 = &.{},
     /// 跨站来源校验（CSRF）：非安全方法校验 `Sec-Fetch-Site` / `Origin`
     csrfGuard: bool = true,
+    /// 跳过 CSRF 校验的路径前缀（无 Cookie / 无会话的机器接口，如 "/api"）。
+    ///
+    /// 这些接口没有可被 CSRF 利用的凭证，跨站调用是**正常业务**（2026-11-24 线上实测：
+    /// 多个站点的页面调用本 API 被 `Sec-Fetch-Site: cross-site` 拦成 403）。
+    csrfSkipPrefixes: []const []const u8 = &.{},
     /// SQL 注入动作
     sqliAction: []const u8 = "block",
     /// XSS 动作
@@ -175,6 +180,7 @@ pub fn clone(a: std.mem.Allocator, cfg: WafConfig) !WafConfig {
     out.sensitivePrefixes = try dupeList(a, cfg.sensitivePrefixes);
     out.skipAttackPrefixes = try dupeList(a, cfg.skipAttackPrefixes);
     out.skipBotPrefixes = try dupeList(a, cfg.skipBotPrefixes);
+    out.csrfSkipPrefixes = try dupeList(a, cfg.csrfSkipPrefixes);
     out.sqliAction = try dupeStr(a, cfg.sqliAction);
     out.xssAction = try dupeStr(a, cfg.xssAction);
     out.pathAction = try dupeStr(a, cfg.pathAction);
@@ -249,6 +255,7 @@ fn applyTable(a: std.mem.Allocator, cfg: *WafConfig, table: *zzig.config.toml.Ta
     if (try zzig.config.toml.getStrList(a, table, "skipAttackPrefixes")) |v| cfg.skipAttackPrefixes = v;
     if (try zzig.config.toml.getStrList(a, table, "skipBotPrefixes")) |v| cfg.skipBotPrefixes = v;
     if (zzig.config.toml.getBool(table, "csrfGuard")) |v| cfg.csrfGuard = v;
+    if (try zzig.config.toml.getStrList(a, table, "csrfSkipPrefixes")) |v| cfg.csrfSkipPrefixes = v;
     if (zzig.config.toml.getStr(table, "sqliAction")) |v| cfg.sqliAction = v;
     if (zzig.config.toml.getStr(table, "xssAction")) |v| cfg.xssAction = v;
     if (zzig.config.toml.getStr(table, "pathAction")) |v| cfg.pathAction = v;
@@ -325,7 +332,9 @@ pub fn renderTemplate(a: std.mem.Allocator, cfg: WafConfig) ![]u8 {
         .{ .key = "blockMaliciousBots", .doc = &.{"拦截恶意爬虫与扫描器（sqlmap / nikto 等 UA 特征）"}, .value = .{ .boolean = cfg.blockMaliciousBots } },
         .{ .key = "sensitivePrefixes", .doc = &.{"敏感路径前缀：该前缀下禁止一切机器人，且攻击「监控」项自动升级为「拦截」（如 \"/admin\"）"}, .value = .{ .string_list = cfg.sensitivePrefixes } },
         .{ .key = "skipAttackPrefixes", .doc = &.{"跳过攻击特征检测的路径前缀（本体就执行 SQL / 接收文件的管理端点）"}, .value = .{ .string_list = cfg.skipAttackPrefixes } },
+        .{ .key = "skipBotPrefixes", .doc = &.{"跳过机器人拦截的路径前缀（机器对机器 API；攻击特征 / IP / CC 仍然生效）"}, .value = .{ .string_list = cfg.skipBotPrefixes } },
         .{ .key = "csrfGuard", .doc = &.{"跨站来源校验（CSRF）：非安全方法校验 Sec-Fetch-Site / Origin"}, .value = .{ .boolean = cfg.csrfGuard } },
+        .{ .key = "csrfSkipPrefixes", .doc = &.{"跳过 CSRF 校验的路径前缀（无 Cookie 的机器接口；跨站调用是正常业务，如 \"/api\"）"}, .value = .{ .string_list = cfg.csrfSkipPrefixes } },
         .{ .key = "sqliAction", .doc = &.{"SQL 注入动作：block（拦截）| monitor（只记录）| off（不检测）"}, .value = .{ .string = cfg.sqliAction } },
         .{ .key = "xssAction", .doc = &.{"XSS 动作（同上取值）"}, .value = .{ .string = cfg.xssAction } },
         .{ .key = "pathAction", .doc = &.{"路径穿越动作（同上取值）"}, .value = .{ .string = cfg.pathAction } },
@@ -386,6 +395,7 @@ test "往返保存与读取（缺键继承预设）" {
     var preset = WafConfig.adminApi();
     preset.skipBotPrefixes = &.{"/api"};
     preset.skipAttackPrefixes = &.{"/api"};
+    preset.csrfSkipPrefixes = &.{"/api"};
 
     var loaded = try loadOrCreate(io, a, path, preset);
     defer loaded.deinit();
@@ -405,6 +415,7 @@ test "往返保存与读取（缺键继承预设）" {
     // 文件缺失的键继承预设（不能被静默清空）
     try std.testing.expectEqualStrings("/api", again.config.skipBotPrefixes[0]);
     try std.testing.expectEqualStrings("/api", again.config.skipAttackPrefixes[0]);
+    try std.testing.expectEqualStrings("/api", again.config.csrfSkipPrefixes[0]);
 
     // 显式空数组时尊重文件
     {
@@ -450,6 +461,8 @@ test "模板渲染可被解析回同样配置" {
     var cfg = WafConfig.publicSite();
     cfg.rulesetFile = "Config/WafRules.json";
     cfg.ipWhitelist = &.{ "127.0.0.1", "10.0.0.0/8" };
+    cfg.skipBotPrefixes = &.{"/api"};
+    cfg.csrfSkipPrefixes = &.{"/api"};
     const text = try renderTemplate(a, cfg);
     defer a.free(text);
 
@@ -462,4 +475,7 @@ test "模板渲染可被解析回同样配置" {
     try std.testing.expectEqual(@as(u32, 600), back.rateLimitPerMin);
     try std.testing.expectEqualStrings("Config/WafRules.json", back.rulesetFile);
     try std.testing.expectEqual(@as(usize, 2), back.ipWhitelist.len);
+    // 模板必须把两个“跳过前缀”写回（曾经漏了 skipBotPrefixes，保存一次就丢）
+    try std.testing.expectEqualStrings("/api", back.skipBotPrefixes[0]);
+    try std.testing.expectEqualStrings("/api", back.csrfSkipPrefixes[0]);
 }
